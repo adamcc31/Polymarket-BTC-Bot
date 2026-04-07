@@ -23,14 +23,14 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
 # Setup Logging
-if not os.path.exists("logs"):
-    os.makedirs("logs")
+LOG_DIR = "/app/logs" if os.environ.get("RAILWAY_ENVIRONMENT") else "logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler("logs/execution_v4.log", encoding='utf-8'),
+        logging.FileHandler(f"{LOG_DIR}/execution_v4.log", encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -44,7 +44,8 @@ class SlowSkewBotV4:
         # Configuration
         self.tfm_window_mins = 15
         self.baseline_window_mins = 240
-        self.z_threshold = 1.0 
+        self.z_threshold = 1.0 # Detection threshold
+        self.notif_threshold = 5.0 # Alert threshold
         
         # State
         self.yes_token_id = None
@@ -52,10 +53,11 @@ class SlowSkewBotV4:
         self.price_buffer = deque(maxlen=self.baseline_window_mins)
         self.last_minute_price = None
         self.last_minute_ts = None
+        self.last_heartbeat = 0
         
         # Clients
         self.clob_client = None
-        self.telemetry_file = "logs/execution_v4_telemetry.csv"
+        self.telemetry_file = f"{LOG_DIR}/execution_v4_telemetry.csv"
         self._init_telemetry()
 
     def _init_telemetry(self):
@@ -84,15 +86,12 @@ class SlowSkewBotV4:
             return False
 
     def bootstrap_discovery(self):
-        """Hardened Discovery v18: Safe Parsing & Manual Override."""
-        # 1. Manual Override Check (VPS Fail-safe)
         manual_id = os.environ.get("TARGET_TOKEN_ID")
         if manual_id:
             logger.info(f"🛡️ MANUAL OVERRIDE: Using Token ID {manual_id}")
             self.yes_token_id = manual_id
             return True
 
-        # 2. Local Cache Check
         if os.path.exists('tmp_tokens.txt'):
             try:
                 with open('tmp_tokens.txt', 'r') as f:
@@ -101,22 +100,18 @@ class SlowSkewBotV4:
                     return True
             except: pass
 
-        # 3. Robust Autonomous Scan
         logger.info("Searching for LIQUID active Bitcoin market (Limit 50)...")
         try:
             r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=10)
             markets = r.json()
             for m in markets:
                 if "Bitcoin" in m.get('question', '') and m.get('clobTokenIds'):
-                    # SAFE PARSING: Handle list or string format
                     ids = m['clobTokenIds']
                     if isinstance(ids, str):
                         try: ids = json.loads(ids)
                         except: ids = [ids.replace('[','').replace(']','').replace('"','')]
-                    
                     if not ids: continue
                     tid = ids[0]
-                    
                     try:
                         logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid}")
                         self.clob_client.get_order_book(tid)
@@ -124,12 +119,22 @@ class SlowSkewBotV4:
                         self.target_market_slug = m.get('market_slug')
                         logger.info(f"🎯 LIQUID TARGET FOUND: {m['question']}")
                         return True
-                    except:
-                        continue
+                    except: continue
             return False
         except Exception as e:
             logger.error(f"Discovery failed: {e}")
             return False
+
+    async def send_alert(self, session, title, message):
+        webhook_url = os.environ.get("NOTIF_WEBHOOK_URL")
+        if not webhook_url: return
+        try:
+            payload = {"content": f"🔥 **{title}**\n{message}"}
+            async with session.post(webhook_url, json=payload, timeout=5) as resp:
+                if resp.status >= 300:
+                    logger.warning(f"Webhook failed: {resp.status}")
+        except Exception as e:
+            logger.error(f"Notification error: {e}")
 
     async def get_pyth_price(self, session):
         try:
@@ -138,9 +143,7 @@ class SlowSkewBotV4:
                 price_info = data['parsed'][0]['price']
                 price = float(price_info['price']) * (10 ** price_info['expo'])
                 return price
-        except Exception as e:
-            logger.error(f"Pyth Feed Error: {e}")
-            return None
+        except Exception: return None
 
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
@@ -155,29 +158,40 @@ class SlowSkewBotV4:
                     now = datetime.now()
                     current_minute = now.replace(second=0, microsecond=0)
                     
+                    # 💓 HEARTBEAT (Every 5 Minutes)
+                    if time.time() - self.last_heartbeat > 300:
+                        logger.info(f"💓 HEARTBEAT: Monitoring {self.target_market_slug or 'Active Target'}. BTC: ${price:,.2f} | Samples: {len(self.price_buffer)}")
+                        self.last_heartbeat = time.time()
+                    
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
                         momentum = price - self.last_minute_price
                         self.price_buffer.append(momentum)
-                        await self.evaluate_signal()
+                        await self.evaluate_signal(session)
                         self.last_minute_price = price
                     
                     if not self.last_minute_ts:
                         self.last_minute_price = price
                     self.last_minute_ts = current_minute
-                    await asyncio.sleep(5) # Higher frequency sampling
+                    await asyncio.sleep(5)
                 except Exception as e:
-                    logger.error(f"Main loop error: {e}")
+                    logger.error(f"Loop error: {e}")
                     await asyncio.sleep(5)
 
-    async def evaluate_signal(self):
-        if len(self.price_buffer) < 5: return # Start early in dry-run
+    async def evaluate_signal(self, session):
+        if len(self.price_buffer) < 5: return
         history = list(self.price_buffer)
         mu, sigma = np.mean(history), np.std(history)
         if sigma < 1e-9: return
         z = (history[-1] - mu) / sigma
+        
         if abs(z) > self.z_threshold:
             logger.info(f"🚨 SKEW ALERT: Z={z:.2f}. Logging Telemetry...")
             await self.execute_dry_run(z)
+            
+            # 🔥 HIGH-PRIORITY ALERT (Telegram/Discord)
+            if abs(z) >= self.notif_threshold:
+                await self.send_alert(session, "HIGH SKEW ANOMALY DETECTED", 
+                                     f"Z-Score: **{z:.2f}**\nTarget: {self.target_market_slug}\nBTC Momentum Filter active.")
 
     async def execute_dry_run(self, z):
         start_ms = time.time() * 1000
@@ -195,23 +209,19 @@ class SlowSkewBotV4:
                 f.write(f"{datetime.now().isoformat()},{z:.2f},{ask},{bid},{ask_sz},{bid_sz},{latency:.2f},SUCCESS\n")
             logger.info(f"✔ Telemetry OK: {latency:.1f}ms latency | {ask_sz} Size")
         except Exception:
-            logger.error(f"Telemetry error: {traceback.format_exc()}")
+            logger.warning(f"Telemetry write failed (Volume sync?): {traceback.format_exc()}")
 
 async def main():
     bot = SlowSkewBotV4()
     clob_ok = bot.init_clob_client()
     if not clob_ok: return
-    
     if not bot.bootstrap_discovery():
         logger.error("COULD NOT FIND LIQUID TARGET. Exiting.")
         return
-        
     await bot.main_loop()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Shutdown.")
     except Exception:
         logger.error(f"System Fatal: {traceback.format_exc()}")
