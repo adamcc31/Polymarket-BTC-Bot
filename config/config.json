@@ -1,0 +1,82 @@
+{
+  "_comment": "Edit via CLI atau langsung. Tidak perlu restart container.",
+  "_version": "1.0.0",
+
+  "regime": {
+    "vol_lower_threshold"   : 0.15,
+    "vol_upper_threshold"   : 0.80,
+    "binance_spread_max_bps": 5.0,
+    "binance_min_depth_btc" : 0.5
+  },
+
+  "signal": {
+    "margin_of_safety" : 0.05,
+    "ttr_min_minutes"  : 5.0,
+    "ttr_max_minutes"  : 12.0
+  },
+
+  "clob": {
+    "min_depth_usd"          : 10.0,
+    "max_market_vig"         : 0.07,
+    "stale_threshold_seconds": 30,
+    "poll_interval_seconds"  : 5
+  },
+
+  "risk": {
+    "kelly_divisor"              : 2,
+    "max_bet_fraction"           : 0.10,
+    "min_bet_usd"                : 1.00,
+    "daily_loss_limit_pct"       : 0.05,
+    "session_loss_limit_pct"     : 0.03,
+    "consecutive_loss_multiplier": 0.15,
+    "kelly_floor_multiplier"     : 0.25
+  },
+
+  "dry_run": {
+    "pass_win_rate"            : 0.53,
+    "pass_profit_factor"       : 1.10,
+    "pass_dry_run_score"       : 0.70,
+    "pass_max_drawdown"        : -0.15,
+    "min_trades_per_session"   : 10,
+    "go_live_consecutive_pass" : 5,
+    "go_live_min_total_trades" : 100,
+    "abort_consecutive_fail"   : 3,
+    "abort_win_rate_threshold" : 0.48,
+    "abort_consecutive_losses" : 6
+  },
+
+  "model": {
+    "retrain_win_rate_trigger"       : 0.50,
+    "retrain_brier_trigger"          : 0.245,
+    "retrain_consecutive_sessions"   : 2,
+    "ensemble_lgbm_weight"           : 0.70,
+    "ensemble_logreg_weight"         : 0.30,
+    "calibration_method"             : "isotonic"
+  },
+
+  "observability": {
+    "ws_drop_rate_warning_threshold" : 0.001,
+    "ws_drop_rate_error_threshold"   : 0.005,
+    "ws_latency_warning_ms"          : 2000,
+    "clob_poll_interval_seconds"     : 5,
+    "feature_compute_lag_warning_ms" : 500
+  },
+
+  "binance": {
+    "ws_base_url"       : "wss://stream.binance.com:9443/stream",
+    "rest_base_url"     : "https://api.binance.com",
+    "buffer_capacity"   : 500,
+    "stale_threshold_s" : 30,
+    "max_retries"       : 10,
+    "initial_delay_s"   : 1,
+    "backoff_multiplier": 2,
+    "max_delay_s"       : 60
+  },
+
+  "market_discovery": {
+    "poll_interval_s"     : 30,
+    "waiting_poll_s"      : 60,
+    "min_ttr_to_discover" : 5.0,
+    "late_ttr_minutes"    : 3.0
+  }
+}

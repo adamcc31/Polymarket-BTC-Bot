@@ -1,0 +1,30 @@
+# Gunakan Python 3.11 Slim (Optimal untuk VPS)
+FROM python:3.11-slim
+
+# Set working directory di dalam kontainer
+WORKDIR /app
+
+# Instal dependensi sistem yang dibutuhkan oleh Polars/Numpy (jika ada)
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Salin file requirements.txt
+COPY requirements.txt .
+
+# Instal dependensi Python
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Salin seluruh kode proyek (termasuk folder scripts)
+COPY . .
+
+# Buat folder logs untuk telemetry
+RUN mkdir -p logs
+
+# Set Environment Variables default (bisa di-override di Railway Dashboard)
+ENV PYTHONUNBUFFERED=1
+ENV TARGET_MARKET_SLUG="will-the-price-of-bitcoin-be-above-70000-on-april-7"
+
+# Perintah untuk menjalankan bot (Gunakan scripts/execution_bot_v4.py)
+CMD ["python", "scripts/execution_bot_v4.py"]
