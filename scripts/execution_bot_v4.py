@@ -6,6 +6,7 @@ import ssl
 import traceback
 import requests
 import aiohttp
+import json
 from datetime import datetime
 from collections import deque
 import numpy as np
@@ -43,7 +44,7 @@ class SlowSkewBotV4:
         # Configuration
         self.tfm_window_mins = 15
         self.baseline_window_mins = 240
-        self.z_threshold = 1.0 # Detection threshold
+        self.z_threshold = 1.0 
         
         # State
         self.yes_token_id = None
@@ -83,25 +84,47 @@ class SlowSkewBotV4:
             return False
 
     def bootstrap_discovery(self):
-        """Hardened Discovery: Verify CLOB Orderbook before selecting target."""
-        logger.info("Searching for LIQUID active Bitcoin market...")
+        """Hardened Discovery v18: Safe Parsing & Manual Override."""
+        # 1. Manual Override Check (VPS Fail-safe)
+        manual_id = os.environ.get("TARGET_TOKEN_ID")
+        if manual_id:
+            logger.info(f"🛡️ MANUAL OVERRIDE: Using Token ID {manual_id}")
+            self.yes_token_id = manual_id
+            return True
+
+        # 2. Local Cache Check
+        if os.path.exists('tmp_tokens.txt'):
+            try:
+                with open('tmp_tokens.txt', 'r') as f:
+                    self.yes_token_id = f.readline().strip().replace('[','').replace(']','').replace('"','').replace(',','')
+                    logger.info(f"Loaded local target: {self.yes_token_id}")
+                    return True
+            except: pass
+
+        # 3. Robust Autonomous Scan
+        logger.info("Searching for LIQUID active Bitcoin market (Limit 50)...")
         try:
-            r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=20', timeout=10)
+            r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=10)
             markets = r.json()
             for m in markets:
-                # 1. Topic Filter
                 if "Bitcoin" in m.get('question', '') and m.get('clobTokenIds'):
-                    tid = m['clobTokenIds'][0]
-                    # 2. LIQUIDITY AUDIT: Verify CLOB existence
+                    # SAFE PARSING: Handle list or string format
+                    ids = m['clobTokenIds']
+                    if isinstance(ids, str):
+                        try: ids = json.loads(ids)
+                        except: ids = [ids.replace('[','').replace(']','').replace('"','')]
+                    
+                    if not ids: continue
+                    tid = ids[0]
+                    
                     try:
-                        logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid[:10]}")
+                        logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid}")
                         self.clob_client.get_order_book(tid)
                         self.yes_token_id = tid
                         self.target_market_slug = m.get('market_slug')
                         logger.info(f"🎯 LIQUID TARGET FOUND: {m['question']}")
                         return True
                     except:
-                        logger.warning(f"Skipping market {m.get('market_slug')} (No CLOB orderbook)")
                         continue
             return False
         except Exception as e:
@@ -109,7 +132,6 @@ class SlowSkewBotV4:
             return False
 
     async def get_pyth_price(self, session):
-        """Bypass Geographic restrictions using Decantralized Pyth Data."""
         try:
             async with session.get(PYTH_HERMES_URL, timeout=5) as resp:
                 data = await resp.json()
@@ -134,7 +156,6 @@ class SlowSkewBotV4:
                     current_minute = now.replace(second=0, microsecond=0)
                     
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
-                        # Minute Concluded: Calculate Momentum (Price Change)
                         momentum = price - self.last_minute_price
                         self.price_buffer.append(momentum)
                         await self.evaluate_signal()
@@ -143,24 +164,19 @@ class SlowSkewBotV4:
                     if not self.last_minute_ts:
                         self.last_minute_price = price
                     self.last_minute_ts = current_minute
-                    
-                    await asyncio.sleep(10) # 10s Sampling
+                    await asyncio.sleep(5) # Higher frequency sampling
                 except Exception as e:
-                    logger.error(f"Main loop crash: {e}")
+                    logger.error(f"Main loop error: {e}")
                     await asyncio.sleep(5)
 
     async def evaluate_signal(self):
-        if len(self.price_buffer) < 30: return # Wait for baseline
-        
+        if len(self.price_buffer) < 5: return # Start early in dry-run
         history = list(self.price_buffer)
         mu, sigma = np.mean(history), np.std(history)
         if sigma < 1e-9: return
-        
-        current_mom = history[-1]
-        z = (current_mom - mu) / sigma
-        
+        z = (history[-1] - mu) / sigma
         if abs(z) > self.z_threshold:
-            logger.info(f"🚨 CLOUD SKEW ALERT: Z={z:.2f}. Probing Orderbook...")
+            logger.info(f"🚨 SKEW ALERT: Z={z:.2f}. Logging Telemetry...")
             await self.execute_dry_run(z)
 
     async def execute_dry_run(self, z):
@@ -183,17 +199,13 @@ class SlowSkewBotV4:
 
 async def main():
     bot = SlowSkewBotV4()
-    
-    # 🔗 CLOUD HANDSHAKE
     clob_ok = bot.init_clob_client()
     if not clob_ok: return
     
-    # 🎯 SMART DISCOVERY (Liquid Only)
     if not bot.bootstrap_discovery():
         logger.error("COULD NOT FIND LIQUID TARGET. Exiting.")
         return
         
-    # Start Cloud Monitoring
     await bot.main_loop()
 
 if __name__ == "__main__":
