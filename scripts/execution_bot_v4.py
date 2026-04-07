@@ -36,8 +36,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# PYTH CONFIG: BTC/USD Price Feed ID (V2 Standard)
-PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest?ids=0xe62df6c8b4a859e8fe9ad4715766d1737f53f8d9756117ac6667d0a2307827d9"
+# PYTH CONFIG: BTC/USD Price Feed ID (V1 Stable)
+PYTH_HERMES_URL = "https://hermes.pyth.network/v1/latest_price_feeds?ids[]=0xe62df6c8b4a859e8fe9ad4715766d1737f53f8d9756117ac6667d0a2307827d9"
 
 class SlowSkewBotV4:
     def __init__(self):
@@ -49,7 +49,7 @@ class SlowSkewBotV4:
         
         # State
         self.yes_token_id = None
-        self.target_market_slug = "Unknown"
+        self.target_market_name = "Target Discovery Pending..."
         self.price_buffer = deque(maxlen=self.baseline_window_mins)
         self.last_minute_price = None
         self.last_minute_ts = None
@@ -108,8 +108,9 @@ class SlowSkewBotV4:
                         logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid}")
                         self.clob_client.get_order_book(tid)
                         self.yes_token_id = tid
-                        self.target_market_slug = m.get('market_slug', 'Unknown')
-                        logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_slug}")
+                        # Using full question as the identity label
+                        self.target_market_name = m.get('question', 'Unknown Bitcoin Market')
+                        logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_name}")
                         return True
                     except: continue
             return False
@@ -123,7 +124,7 @@ class SlowSkewBotV4:
         if tg_token and tg_chat:
             try:
                 url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-                payload = {"chat_id": tg_chat, "text": f"🔥 {title}\n\n{message}", "parse_mode": "Markdown"}
+                payload = {"chat_id": tg_chat, "text": f"🔥 {title}\n\n{message}"}
                 async with session.post(url, json=payload, timeout=5) as resp:
                     if resp.status == 200: return
             except: pass
@@ -136,27 +137,29 @@ class SlowSkewBotV4:
         except: pass
 
     async def get_pyth_price(self, session):
+        """Standardized V1 Price Parser."""
         try:
             async with session.get(PYTH_HERMES_URL, timeout=10) as resp:
                 if resp.status != 200:
-                    logger.error(f"Pyth API Error: {resp.status} (Raw Context: {resp.url})")
+                    logger.error(f"Pyth API Error: {resp.status}")
                     return None
                 data = await resp.json()
-                parsed_list = data.get('parsed', [])
-                if not parsed_list: return None
-                p_item = parsed_list[0]
-                p_info = p_item.get('price', {})
-                price = float(p_info.get('price', 0)) * (10 ** int(p_info.get('expo', 0)))
-                return price
+                if isinstance(data, list) and len(data) > 0:
+                    p_info = data[0].get('price', {})
+                    raw_px = p_info.get('price')
+                    expo = p_info.get('expo')
+                    if raw_px is not None and expo is not None:
+                        return float(raw_px) * (10 ** int(expo))
+                return None
         except Exception: return None
 
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
-            logger.info(f"🟢 CLOUD BOT ACTIVE. Target: {self.target_market_slug}")
+            logger.info(f"🟢 CLOUD BOT ACTIVE. Target: {self.target_market_name}")
             
-            # NOTIFICATION AFTER TARGET IS CONFIRMED
+            # NOTIFICATION PROTOTYPE v23
             await self.send_alert(session, "[SYSTEM ONLINE]", 
-                                 f"Slow Skew Bot v4 is sampling BTC data.\nTarget: `{self.target_market_slug}`")
+                                 f"Slow Skew Bot is now sampling BTC data.\nTarget: `{self.target_market_name}`")
             
             while True:
                 try:
@@ -173,7 +176,7 @@ class SlowSkewBotV4:
                         self.last_heartbeat = time.time()
                     
                     if time.time() - self.last_tg_heartbeat > 14400:
-                        await self.send_alert(session, "[HEARTBEAT]", f"Healthy. BTC: ${price:,.2f}")
+                        await self.send_alert(session, "[HEARTBEAT]", f"Active. BTC: ${price:,.2f}")
                         self.last_tg_heartbeat = time.time()
 
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
@@ -204,7 +207,7 @@ class SlowSkewBotV4:
             await self.execute_dry_run(z)
             if abs(z) >= self.notif_threshold:
                 await self.send_alert(session, "HIGH MOMENTUM", 
-                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`")
+                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`\nMarket: {self.target_market_name}")
 
     async def execute_dry_run(self, z):
         start_ms = time.time() * 1000
