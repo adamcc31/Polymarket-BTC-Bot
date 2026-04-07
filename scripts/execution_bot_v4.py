@@ -43,8 +43,8 @@ file_handler.setFormatter(log_formatter)
 logging.basicConfig(level=logging.INFO, handlers=[stdout_handler, stderr_handler, file_handler])
 logger = logging.getLogger(__name__)
 
-# CONFIG: HARDENED BTC/USD Price Feed ID
-BTC_FEED_ID = "0xe62df6c8b4a94ed1aee7242143411a931112ddf1bd8147cd1b641375f79f58"
+# CONFIG: VERIFIED BTC/USD Price Feed ID (2026 Active)
+BTC_FEED_ID = "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
 PYTH_HERMES_BASE = "https://hermes.pyth.network/v2/updates/price/latest"
 BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
 
@@ -83,7 +83,6 @@ class SlowSkewBotV4:
         api_passphrase = os.environ.get("POLY_BUILDER_PASSPHRASE")
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
         if not all([api_key, api_secret, api_passphrase, private_key]):
-            logger.warning("Missing API. MONITOR ONLY.")
             return False
         try:
             creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
@@ -97,10 +96,9 @@ class SlowSkewBotV4:
     def bootstrap_discovery(self):
         manual_id = os.environ.get("TARGET_TOKEN_ID")
         if manual_id:
-            logger.info(f"🛡️ MANUAL OVERRIDE: {manual_id}")
             self.yes_token_id = manual_id
             return True
-        logger.info("Searching for Active Bitcoin target (Gamma API)...")
+        logger.info("Searching for Active Bitcoin target...")
         try:
             r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=10)
             markets = r.json()
@@ -145,8 +143,8 @@ class SlowSkewBotV4:
         except Exception: return None
 
     async def get_pyth_price(self, session):
-        """Optimized Syntax with Exponential Backoff Logic."""
-        # Use a list of values for params to force array parsing in aiohttp
+        """Primary Oracle: V2 Hermes with Verified Feed ID."""
+        # Querying with encoded array param correctly
         params = {"ids[]": [BTC_FEED_ID]}
         try:
             async with session.get(PYTH_HERMES_BASE, params=params, timeout=10) as resp:
@@ -154,13 +152,19 @@ class SlowSkewBotV4:
                     data = await resp.json()
                     self.pyth_fail_count = 0
                     self.is_redundant_mode = False
+                    
+                    # Hermes V2 response parsing
                     parsed = data.get('parsed', []) if isinstance(data, dict) else []
                     if parsed:
                         p_info = parsed[0].get('price', {})
-                        return float(p_info.get('price', 0)) * (10 ** int(p_info.get('expo', 0)))
-                else: 
-                    logger.warning(f"Pyth Error {resp.status}. Backoff {self.pyth_fail_count+1}")
-        except Exception: pass
+                        raw_px = p_info.get('price')
+                        expo = p_info.get('expo')
+                        if raw_px is not None and expo is not None:
+                            return float(raw_px) * (10 ** int(expo))
+                else:
+                    logger.warning(f"Pyth Primary failed ({resp.status}). Activating Binance Fallback...")
+        except Exception as e:
+            logger.debug(f"Pyth Error: {e}")
         
         self.pyth_fail_count += 1
         self.is_redundant_mode = True
@@ -168,9 +172,9 @@ class SlowSkewBotV4:
 
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
-            logger.info("🟢 CLOUD BOT ACTIVE (v27: Optimized Cycle).")
+            logger.info("🟢 CLOUD BOT ACTIVE (v28: Verified Ingest).")
             await self.send_alert(session, "[SYSTEM ONLINE]", 
-                                 f"Loop: 15s | Mode: Opt-Polling\nTarget: `{self.target_market_name}`")
+                                 f"Verified Feed ID: {BTC_FEED_ID[:10]}...\nTarget: `{self.target_market_name}`")
             
             while True:
                 try:
@@ -184,11 +188,11 @@ class SlowSkewBotV4:
                     
                     if self.last_heartbeat == 0 or (time.time() - self.last_heartbeat > 300):
                         source = "Binance (Backup)" if self.is_redundant_mode else "Pyth (Primary)"
-                        logger.info(f"💓 HEARTBEAT | Source: {source} | BTC: ${price:,.2f} | Buff: {len(self.price_buffer)}")
+                        logger.info(f"💓 HEARTBEAT | Source: {source} | BTC: ${price:,.2f}")
                         self.last_heartbeat = time.time()
                     
                     if time.time() - self.last_tg_heartbeat > 14400:
-                        await self.send_alert(session, "[HEARTBEAT]", f"BTC: ${price:,.2f} (Status: OK)")
+                        await self.send_alert(session, "[HEARTBEAT]", f"BTC Stable: ${price:,.2f}")
                         self.last_tg_heartbeat = time.time()
 
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
@@ -199,11 +203,11 @@ class SlowSkewBotV4:
                     
                     if not self.last_minute_ts:
                         self.last_minute_price = price
-                        logger.info(f"Baseline anchored: ${price:,.2f}")
+                        logger.info(f"Baseline set: ${price:,.2f}")
                     
                     self.last_minute_ts = current_minute
                     
-                    # CYCLE OPTIMIZATION: 15s intervals + Backoff delay
+                    # Intelligent Polling: 15s base + backoff for failed Pyth
                     backoff_delay = min(self.pyth_fail_count * 15, 60) if self.is_redundant_mode else 0
                     await asyncio.sleep(15 + backoff_delay)
                 except Exception as e:
@@ -213,24 +217,21 @@ class SlowSkewBotV4:
     async def evaluate_signal(self, session, current_price):
         if len(self.price_buffer) < 2: return
         history = list(self.price_buffer)
-        
-        # DISPARITY SHIELD: Add margin when in Redundant mode
         margin_mult = 1.001 if self.is_redundant_mode else 1.0
         
         mu, sigma = np.mean(history), np.std(history)
         if sigma < 1e-9: return
         
-        # We apply margin to the detection threshold
-        effective_z_threshold = self.z_threshold * margin_mult
         z = (history[-1] - mu) / sigma
+        eff_threshold = self.z_threshold * margin_mult
         
-        if abs(z) > effective_z_threshold:
-            mode_label = "REDUNDANT" if self.is_redundant_mode else "PRIMARY"
-            logger.info(f"🚨 SKEW ALERT [{mode_label}]: Z={z:.2f}")
+        if abs(z) > eff_threshold:
+            mode = "REDUNDANT" if self.is_redundant_mode else "PRIMARY"
+            logger.info(f"🚨 SKEW ALERT [{mode}]: Z={z:.2f}")
             await self.execute_dry_run(z)
             if abs(z) >= self.notif_threshold:
-                await self.send_alert(session, f"HIGH MOMENTUM ({mode_label})", 
-                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`\nMargin: {margin_mult:.3f}")
+                await self.send_alert(session, f"HIGH MOMENTUM ({mode})", 
+                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`")
 
     async def execute_dry_run(self, z):
         start_ms = time.time() * 1000
@@ -253,7 +254,7 @@ async def main():
     bot = SlowSkewBotV4()
     if not bot.init_clob_client(): return
     if not bot.bootstrap_discovery():
-        logger.error("COULD NOT FIND TARGET. Exiting.")
+        logger.error("COULD NOT FIND TARGET.")
         return
     await bot.main_loop()
 
