@@ -27,23 +27,16 @@ from py_clob_client.clob_types import ApiCreds
 LOG_DIR = "/app/logs" if os.environ.get("RAILWAY_ENVIRONMENT") else "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Correcting severity: Force INFO to stdout (Railway color fix)
 class InfoFilter(logging.Filter):
     def filter(self, record): return record.levelno < logging.ERROR
 
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-
-# Standard Stream (INFO)
 stdout_handler = logging.StreamHandler(sys.stdout)
 stdout_handler.setFormatter(log_formatter)
 stdout_handler.addFilter(InfoFilter())
-
-# Error Stream (ERROR)
 stderr_handler = logging.StreamHandler(sys.stderr)
 stderr_handler.setLevel(logging.ERROR)
 stderr_handler.setFormatter(log_formatter)
-
-# File Persistent
 file_handler = logging.FileHandler(f"{LOG_DIR}/execution_v4.log", encoding='utf-8')
 file_handler.setFormatter(log_formatter)
 
@@ -65,12 +58,14 @@ class SlowSkewBotV4:
         
         # State
         self.yes_token_id = None
-        self.target_market_name = "Target Discovery Pending..."
+        self.target_market_name = "Target Discovery Active..."
         self.price_buffer = deque(maxlen=self.baseline_window_mins)
         self.last_minute_price = None
         self.last_minute_ts = None
         self.last_heartbeat = 0
         self.last_tg_heartbeat = 0
+        self.is_redundant_mode = False
+        self.pyth_fail_count = 0
         
         # Clients
         self.clob_client = None
@@ -80,7 +75,7 @@ class SlowSkewBotV4:
     def _init_telemetry(self):
         if not os.path.exists(self.telemetry_file):
             with open(self.telemetry_file, "w") as f:
-                f.write("trigger_ts,z_score,poly_up_ask,poly_up_bid,ask_size,bid_size,latency_ms,status\n")
+                f.write("trigger_ts,z_score,poly_up_ask,poly_up_bid,ask_size,bid_size,latency_ms,status,source\n")
 
     def init_clob_client(self):
         api_key = os.environ.get("POLY_BUILDER_API_KEY")
@@ -88,9 +83,8 @@ class SlowSkewBotV4:
         api_passphrase = os.environ.get("POLY_BUILDER_PASSPHRASE")
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
         if not all([api_key, api_secret, api_passphrase, private_key]):
-            logger.warning("Missing API credentials. MONITOR ONLY.")
+            logger.warning("Missing API. MONITOR ONLY.")
             return False
-            
         try:
             creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
             self.clob_client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137, creds=creds)
@@ -103,11 +97,10 @@ class SlowSkewBotV4:
     def bootstrap_discovery(self):
         manual_id = os.environ.get("TARGET_TOKEN_ID")
         if manual_id:
-            logger.info(f"🛡️ MANUAL OVERRIDE: Using Token ID {manual_id}")
+            logger.info(f"🛡️ MANUAL OVERRIDE: {manual_id}")
             self.yes_token_id = manual_id
             return True
-
-        logger.info("Searching for LIQUID active Bitcoin market (Limit 50)...")
+        logger.info("Searching for Active Bitcoin target (Gamma API)...")
         try:
             r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=10)
             markets = r.json()
@@ -120,17 +113,15 @@ class SlowSkewBotV4:
                     if not ids: continue
                     tid = ids[0]
                     try:
-                        # Use INFO for auditing logs as requested
-                        logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid}")
                         self.clob_client.get_order_book(tid)
                         self.yes_token_id = tid
                         self.target_market_name = m.get('question', 'Unknown Bitcoin Market')
-                        logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_name}")
+                        logger.info(f"🎯 LIQUID TARGET: {self.target_market_name}")
                         return True
                     except: continue
             return False
         except Exception as e:
-            logger.error(f"Discovery failed: {e}")
+            logger.error(f"Discovery error: {e}")
             return False
 
     async def send_alert(self, session, title, message):
@@ -144,15 +135,7 @@ class SlowSkewBotV4:
                     if resp.status == 200: return
             except: pass
 
-        webhook_url = os.environ.get("NOTIF_WEBHOOK_URL")
-        if not webhook_url: return
-        try:
-            payload = {"content": f"🔥 **{title}**\n{message}"}
-            async with session.post(webhook_url, json=payload, timeout=5) as resp: pass
-        except: pass
-
     async def get_binance_price(self, session):
-        """Redundant oracle: Pulls BTC price from Binance REST."""
         try:
             async with session.get(BINANCE_API_URL, timeout=5) as resp:
                 if resp.status == 200:
@@ -162,29 +145,32 @@ class SlowSkewBotV4:
         except Exception: return None
 
     async def get_pyth_price(self, session):
-        """Primary oracle: Pyth with exact URL params."""
-        params = {"ids[]": BTC_FEED_ID}
+        """Optimized Syntax with Exponential Backoff Logic."""
+        # Use a list of values for params to force array parsing in aiohttp
+        params = {"ids[]": [BTC_FEED_ID]}
         try:
             async with session.get(PYTH_HERMES_BASE, params=params, timeout=10) as resp:
                 if resp.status == 200:
                     data = await resp.json()
+                    self.pyth_fail_count = 0
+                    self.is_redundant_mode = False
                     parsed = data.get('parsed', []) if isinstance(data, dict) else []
                     if parsed:
                         p_info = parsed[0].get('price', {})
                         return float(p_info.get('price', 0)) * (10 ** int(p_info.get('expo', 0)))
-                else:
-                    logger.warning(f"Pyth primary failed ({resp.status}). Activating Binance Fallback...")
-        except Exception: 
-            logger.warning("Pyth connection error. Activating Binance Fallback...")
+                else: 
+                    logger.warning(f"Pyth Error {resp.status}. Backoff {self.pyth_fail_count+1}")
+        except Exception: pass
         
-        # ACTIVATE REDUNDANCY
+        self.pyth_fail_count += 1
+        self.is_redundant_mode = True
         return await self.get_binance_price(session)
 
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
-            logger.info(f"🟢 CLOUD BOT ACTIVE. Mode: Redundant Oracle (v26).")
+            logger.info("🟢 CLOUD BOT ACTIVE (v27: Optimized Cycle).")
             await self.send_alert(session, "[SYSTEM ONLINE]", 
-                                 f"Bot running with Binance Redundancy.\nTarget: `{self.target_market_name}`")
+                                 f"Loop: 15s | Mode: Opt-Polling\nTarget: `{self.target_market_name}`")
             
             while True:
                 try:
@@ -197,11 +183,12 @@ class SlowSkewBotV4:
                     current_minute = now.replace(second=0, microsecond=0)
                     
                     if self.last_heartbeat == 0 or (time.time() - self.last_heartbeat > 300):
-                        logger.info(f"💓 HEARTBEAT: BTC: ${price:,.2f} | Buffer: {len(self.price_buffer)}")
+                        source = "Binance (Backup)" if self.is_redundant_mode else "Pyth (Primary)"
+                        logger.info(f"💓 HEARTBEAT | Source: {source} | BTC: ${price:,.2f} | Buff: {len(self.price_buffer)}")
                         self.last_heartbeat = time.time()
                     
                     if time.time() - self.last_tg_heartbeat > 14400:
-                        await self.send_alert(session, "[HEARTBEAT]", f"Active. BTC Redundant: ${price:,.2f}")
+                        await self.send_alert(session, "[HEARTBEAT]", f"BTC: ${price:,.2f} (Status: OK)")
                         self.last_tg_heartbeat = time.time()
 
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
@@ -212,27 +199,38 @@ class SlowSkewBotV4:
                     
                     if not self.last_minute_ts:
                         self.last_minute_price = price
-                        logger.info(f"Baseline set: ${price:,.2f}")
+                        logger.info(f"Baseline anchored: ${price:,.2f}")
                     
                     self.last_minute_ts = current_minute
-                    await asyncio.sleep(10)
+                    
+                    # CYCLE OPTIMIZATION: 15s intervals + Backoff delay
+                    backoff_delay = min(self.pyth_fail_count * 15, 60) if self.is_redundant_mode else 0
+                    await asyncio.sleep(15 + backoff_delay)
                 except Exception as e:
-                    logger.error(f"Fatal Loop Error: {e}")
-                    await asyncio.sleep(5)
+                    logger.error(f"Fatal Loop: {e}")
+                    await asyncio.sleep(15)
 
     async def evaluate_signal(self, session, current_price):
         if len(self.price_buffer) < 2: return
         history = list(self.price_buffer)
+        
+        # DISPARITY SHIELD: Add margin when in Redundant mode
+        margin_mult = 1.001 if self.is_redundant_mode else 1.0
+        
         mu, sigma = np.mean(history), np.std(history)
         if sigma < 1e-9: return
+        
+        # We apply margin to the detection threshold
+        effective_z_threshold = self.z_threshold * margin_mult
         z = (history[-1] - mu) / sigma
         
-        if abs(z) > self.z_threshold:
-            logger.info(f"🚨 SKEW ALERT: Z={z:.2f}")
+        if abs(z) > effective_z_threshold:
+            mode_label = "REDUNDANT" if self.is_redundant_mode else "PRIMARY"
+            logger.info(f"🚨 SKEW ALERT [{mode_label}]: Z={z:.2f}")
             await self.execute_dry_run(z)
             if abs(z) >= self.notif_threshold:
-                await self.send_alert(session, "HIGH MOMENTUM", 
-                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`\nSource: Auto-Redundant Oracle")
+                await self.send_alert(session, f"HIGH MOMENTUM ({mode_label})", 
+                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`\nMargin: {margin_mult:.3f}")
 
     async def execute_dry_run(self, z):
         start_ms = time.time() * 1000
@@ -247,15 +245,15 @@ class SlowSkewBotV4:
             
             latency = time.time() * 1000 - start_ms
             with open(self.telemetry_file, "a") as f:
-                f.write(f"{datetime.now().isoformat()},{z:.2f},{ask},{bid},{ask_sz},{bid_sz},{latency:.2f},SUCCESS\n")
-            logger.info(f"✔ Telemetry Saved: {latency:.1f}ms")
+                f.write(f"{datetime.now().isoformat()},{z:.2f},{ask},{bid},{ask_sz},{bid_sz},{latency:.2f},SUCCESS,{'REDUNDANT' if self.is_redundant_mode else 'PRIMARY'}\n")
+            logger.info(f"✔ Telemetry OK: {latency:.1f}ms")
         except Exception: pass
 
 async def main():
     bot = SlowSkewBotV4()
     if not bot.init_clob_client(): return
     if not bot.bootstrap_discovery():
-        logger.error("COULD NOT FIND LIQUID TARGET.")
+        logger.error("COULD NOT FIND TARGET. Exiting.")
         return
     await bot.main_loop()
 
@@ -263,4 +261,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception:
-        logger.error(f"Fatal Terminal Error: {traceback.format_exc()}")
+        logger.error(f"Terminal Fatal: {traceback.format_exc()}")
