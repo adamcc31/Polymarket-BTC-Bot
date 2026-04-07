@@ -5,6 +5,7 @@ import logging
 import ssl
 import traceback
 import requests
+import aiohttp
 from datetime import datetime
 from collections import deque
 import numpy as np
@@ -17,7 +18,6 @@ ssl._create_default_https_context = ssl._create_unverified_context
 load_dotenv()
 
 # Dependencies
-from binance import AsyncClient, BinanceSocketManager
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
@@ -35,19 +35,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# PYTH CONFIG: BTC/USD Price Feed ID
+PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest?ids[]=ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+
 class SlowSkewBotV4:
     def __init__(self):
         # Configuration
-        self.symbol = "BTCUSDT"
         self.tfm_window_mins = 15
         self.baseline_window_mins = 240
-        self.z_threshold = 1.0 # Standard monitoring threshold
+        self.z_threshold = 1.0 # Detection threshold
         
         # State
         self.yes_token_id = None
         self.target_market_slug = None
-        self.tfm_buffer = deque(maxlen=self.baseline_window_mins)
-        self.current_minute_tfm = 0.0
+        self.price_buffer = deque(maxlen=self.baseline_window_mins)
+        self.last_minute_price = None
         self.last_minute_ts = None
         
         # Clients
@@ -80,65 +82,85 @@ class SlowSkewBotV4:
             logger.error(f"CLOB Init Failed: {traceback.format_exc()}")
             return False
 
-    def load_target(self):
-        """Tries local file first, then falls back to Autonomous Discovery."""
-        # 1. Local Cache Check
-        if os.path.exists('tmp_tokens.txt'):
-            try:
-                with open('tmp_tokens.txt', 'r') as f:
-                    raw = f.readline().strip().replace('[','').replace(']','').replace('"','').replace(',','')
-                    self.yes_token_id = raw
-                    logger.info(f"Loaded local target: {self.yes_token_id}")
-                    return True
-            except: pass
-
-        # 2. Autonomous Discovery (VPS Fallback)
-        logger.info("Searching for top active Bitcoin market...")
+    def bootstrap_discovery(self):
+        """Hardened Discovery: Verify CLOB Orderbook before selecting target."""
+        logger.info("Searching for LIQUID active Bitcoin market...")
         try:
             r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=20', timeout=10)
             markets = r.json()
             for m in markets:
-                # Find Bitcoin-related liquid markets
+                # 1. Topic Filter
                 if "Bitcoin" in m.get('question', '') and m.get('clobTokenIds'):
-                    self.yes_token_id = m['clobTokenIds'][0]
-                    self.target_market_slug = m.get('market_slug', 'discovered-market')
-                    logger.info(f"🎯 AUTONOMOUS DISCOVERY: Found '{m['question']}'")
-                    logger.info(f"Target Token: {self.yes_token_id}")
-                    return True
+                    tid = m['clobTokenIds'][0]
+                    # 2. LIQUIDITY AUDIT: Verify CLOB existence
+                    try:
+                        logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid[:10]}")
+                        self.clob_client.get_order_book(tid)
+                        self.yes_token_id = tid
+                        self.target_market_slug = m.get('market_slug')
+                        logger.info(f"🎯 LIQUID TARGET FOUND: {m['question']}")
+                        return True
+                    except:
+                        logger.warning(f"Skipping market {m.get('market_slug')} (No CLOB orderbook)")
+                        continue
             return False
         except Exception as e:
             logger.error(f"Discovery failed: {e}")
             return False
 
-    async def bootstrap_binance(self, client):
-        logger.info(f"Seed TFM baseline (240m)...")
-        for _ in range(self.baseline_window_mins):
-            self.tfm_buffer.append(np.random.normal(0, 5000))
-
-    async def handle_binance_trade(self, trade):
+    async def get_pyth_price(self, session):
+        """Bypass Geographic restrictions using Decantralized Pyth Data."""
         try:
-            val = float(trade['p']) * float(trade['q']) * (1.0 if not trade['m'] else -1.0)
-            self.current_minute_tfm += val
-            ts = datetime.fromtimestamp(trade['T'] / 1000)
-            current_minute = ts.replace(second=0, microsecond=0)
-            
-            if self.last_minute_ts and current_minute > self.last_minute_ts:
-                self.tfm_buffer.append(self.current_minute_tfm)
-                final_tfm = self.current_minute_tfm
-                self.current_minute_tfm = 0.0
-                await self.evaluate_signal(final_tfm)
-            self.last_minute_ts = current_minute
+            async with session.get(PYTH_HERMES_URL, timeout=5) as resp:
+                data = await resp.json()
+                price_info = data['parsed'][0]['price']
+                price = float(price_info['price']) * (10 ** price_info['expo'])
+                return price
         except Exception as e:
-            logger.error(f"Logic loop error: {e}")
+            logger.error(f"Pyth Feed Error: {e}")
+            return None
 
-    async def evaluate_signal(self, current_tfm):
-        history = list(self.tfm_buffer)
-        tfm_15m = sum(history[-15:])
+    async def main_loop(self):
+        async with aiohttp.ClientSession() as session:
+            logger.info("🟢 CLOUD BOT ACTIVE (Source: Pyth Network).")
+            while True:
+                try:
+                    price = await self.get_pyth_price(session)
+                    if not price: 
+                        await asyncio.sleep(1)
+                        continue
+                        
+                    now = datetime.now()
+                    current_minute = now.replace(second=0, microsecond=0)
+                    
+                    if self.last_minute_ts and current_minute > self.last_minute_ts:
+                        # Minute Concluded: Calculate Momentum (Price Change)
+                        momentum = price - self.last_minute_price
+                        self.price_buffer.append(momentum)
+                        await self.evaluate_signal()
+                        self.last_minute_price = price
+                    
+                    if not self.last_minute_ts:
+                        self.last_minute_price = price
+                    self.last_minute_ts = current_minute
+                    
+                    await asyncio.sleep(10) # 10s Sampling
+                except Exception as e:
+                    logger.error(f"Main loop crash: {e}")
+                    await asyncio.sleep(5)
+
+    async def evaluate_signal(self):
+        if len(self.price_buffer) < 30: return # Wait for baseline
+        
+        history = list(self.price_buffer)
         mu, sigma = np.mean(history), np.std(history)
-        if sigma < 1e-6: return
-        z = (tfm_15m - mu) / sigma
+        if sigma < 1e-9: return
+        
+        current_mom = history[-1]
+        z = (current_mom - mu) / sigma
+        
         if abs(z) > self.z_threshold:
-            logger.info(f"🚨 SKEW ALERT: Z={z:.2f}. Probing Polymarket...")
+            logger.info(f"🚨 CLOUD SKEW ALERT: Z={z:.2f}. Probing Orderbook...")
             await self.execute_dry_run(z)
 
     async def execute_dry_run(self, z):
@@ -155,42 +177,29 @@ class SlowSkewBotV4:
             latency = time.time() * 1000 - start_ms
             with open(self.telemetry_file, "a") as f:
                 f.write(f"{datetime.now().isoformat()},{z:.2f},{ask},{bid},{ask_sz},{bid_sz},{latency:.2f},SUCCESS\n")
-            logger.info(f"✔ Telemetry OK: {latency:.1f}ms latency | {ask_sz} Liquidity")
+            logger.info(f"✔ Telemetry OK: {latency:.1f}ms latency | {ask_sz} Size")
         except Exception:
             logger.error(f"Telemetry error: {traceback.format_exc()}")
 
 async def main():
     bot = SlowSkewBotV4()
     
-    # 🔗 VPS-READY: Polymarket + Discovery
+    # 🔗 CLOUD HANDSHAKE
     clob_ok = bot.init_clob_client()
     if not clob_ok: return
     
-    # Discovery Fallback
-    if not bot.load_target():
+    # 🎯 SMART DISCOVERY (Liquid Only)
+    if not bot.bootstrap_discovery():
         logger.error("COULD NOT FIND LIQUID TARGET. Exiting.")
         return
-
-    try:
-        logger.info("Connecting to Binance (Timeout 60s)...")
-        client = await AsyncClient.create(requests_params={'timeout': 60})
-        await client.ping()
-        bm = BinanceSocketManager(client)
-        ts = bm.aggtrade_socket(bot.symbol)
-        await bot.bootstrap_binance(client)
         
-        logger.info("🟢 BOT LIVE ON CLOUD. MONITORING DATA FLOW.")
-        async with ts as tscm:
-            while True:
-                res = await tscm.recv()
-                if res: await bot.handle_binance_trade(res)
-    except (asyncio.TimeoutError, Exception):
-        logger.warning(f"Network Issue: {traceback.format_exc()}")
-        logger.info("🔄 FALLBACK: Running Internal Telemetry Tests...")
-        for _ in range(3):
-            await bot.execute_dry_run(6.9)
-            await asyncio.sleep(2)
-        logger.info("Deployment Verified.")
+    # Start Cloud Monitoring
+    await bot.main_loop()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutdown.")
+    except Exception:
+        logger.error(f"System Fatal: {traceback.format_exc()}")
