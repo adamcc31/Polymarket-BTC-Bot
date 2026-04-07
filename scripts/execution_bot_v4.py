@@ -45,7 +45,7 @@ class SlowSkewBotV4:
         self.tfm_window_mins = 15
         self.baseline_window_mins = 240
         self.z_threshold = 1.0 # Detection threshold
-        self.notif_threshold = 5.0 # Alert threshold
+        self.notif_threshold = 5.0 # High-alpha alert threshold
         
         # State
         self.yes_token_id = None
@@ -54,6 +54,7 @@ class SlowSkewBotV4:
         self.last_minute_price = None
         self.last_minute_ts = None
         self.last_heartbeat = 0
+        self.last_tg_heartbeat = 0
         
         # Clients
         self.clob_client = None
@@ -126,6 +127,19 @@ class SlowSkewBotV4:
             return False
 
     async def send_alert(self, session, title, message):
+        # 1. TELEGRAM NATIVE
+        tg_token = os.environ.get("TELEGRAM_TOKEN")
+        tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
+        if tg_token and tg_chat:
+            try:
+                url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+                payload = {"chat_id": tg_chat, "text": f"🔥 {title}\n\n{message}", "parse_mode": "Markdown"}
+                async with session.post(url, json=payload, timeout=5) as resp:
+                    if resp.status == 200: return
+            except Exception as e:
+                logger.error(f"Telegram failed: {e}")
+
+        # 2. WEBHOOK FALLBACK (Discord)
         webhook_url = os.environ.get("NOTIF_WEBHOOK_URL")
         if not webhook_url: return
         try:
@@ -148,6 +162,10 @@ class SlowSkewBotV4:
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
             logger.info("🟢 CLOUD BOT ACTIVE (Source: Pyth Network).")
+            # INITIAL ONLINE NOTIFICATION
+            await self.send_alert(session, "[SYSTEM ONLINE]", 
+                                 f"Slow Skew Bot v4 has started successfully.\nTarget: {self.target_market_slug or 'Discovery Active'}")
+            
             while True:
                 try:
                     price = await self.get_pyth_price(session)
@@ -158,15 +176,21 @@ class SlowSkewBotV4:
                     now = datetime.now()
                     current_minute = now.replace(second=0, microsecond=0)
                     
-                    # 💓 HEARTBEAT (Every 5 Minutes)
+                    # 💓 CONSOLE HEARTBEAT (Every 5 Minutes)
                     if time.time() - self.last_heartbeat > 300:
                         logger.info(f"💓 HEARTBEAT: Monitoring {self.target_market_slug or 'Active Target'}. BTC: ${price:,.2f} | Samples: {len(self.price_buffer)}")
                         self.last_heartbeat = time.time()
                     
+                    # 📱 TELEGRAM HEARTBEAT (Every 4 Hours to avoid spam)
+                    if time.time() - self.last_tg_heartbeat > 14400:
+                        await self.send_alert(session, "[HEARTBEAT]", 
+                                             f"System is healthy.\nBTC: ${price:,.2f}\nZ-Score Samples: {len(self.price_buffer)}")
+                        self.last_tg_heartbeat = time.time()
+
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
                         momentum = price - self.last_minute_price
                         self.price_buffer.append(momentum)
-                        await self.evaluate_signal(session)
+                        await self.evaluate_signal(session, price)
                         self.last_minute_price = price
                     
                     if not self.last_minute_ts:
@@ -177,7 +201,7 @@ class SlowSkewBotV4:
                     logger.error(f"Loop error: {e}")
                     await asyncio.sleep(5)
 
-    async def evaluate_signal(self, session):
+    async def evaluate_signal(self, session, current_price):
         if len(self.price_buffer) < 5: return
         history = list(self.price_buffer)
         mu, sigma = np.mean(history), np.std(history)
@@ -188,10 +212,9 @@ class SlowSkewBotV4:
             logger.info(f"🚨 SKEW ALERT: Z={z:.2f}. Logging Telemetry...")
             await self.execute_dry_run(z)
             
-            # 🔥 HIGH-PRIORITY ALERT (Telegram/Discord)
             if abs(z) >= self.notif_threshold:
                 await self.send_alert(session, "HIGH SKEW ANOMALY DETECTED", 
-                                     f"Z-Score: **{z:.2f}**\nTarget: {self.target_market_slug}\nBTC Momentum Filter active.")
+                                     f"Z-Score: `{z:.2f}`\nBTC Price: `${current_price:,.2f}`\nTarget: {self.target_market_slug}\nStatus: **Dry-Run Mode**")
 
     async def execute_dry_run(self, z):
         start_ms = time.time() * 1000
@@ -209,7 +232,7 @@ class SlowSkewBotV4:
                 f.write(f"{datetime.now().isoformat()},{z:.2f},{ask},{bid},{ask_sz},{bid_sz},{latency:.2f},SUCCESS\n")
             logger.info(f"✔ Telemetry OK: {latency:.1f}ms latency | {ask_sz} Size")
         except Exception:
-            logger.warning(f"Telemetry write failed (Volume sync?): {traceback.format_exc()}")
+            logger.warning(f"Telemetry write failed: {traceback.format_exc()}")
 
 async def main():
     bot = SlowSkewBotV4()
