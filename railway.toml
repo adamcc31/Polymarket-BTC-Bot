@@ -2,12 +2,12 @@
 builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "python main.py --mode dry-run"
+startCommand = "python scripts/execution_bot_v4.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
 
 [[volumes]]
-mountPath = "/app/data"
+mountPath = "/app/logs"
 
 [environments.production]
-startCommand = "python main.py --mode live --confirm-live"
+startCommand = "python scripts/execution_bot_v4.py"
