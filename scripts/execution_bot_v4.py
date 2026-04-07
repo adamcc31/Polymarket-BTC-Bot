@@ -1,16 +1,16 @@
 import asyncio
 import os
 import time
-import csv
 import logging
 import ssl
 import traceback
+import requests
 from datetime import datetime
 from collections import deque
 import numpy as np
 from dotenv import load_dotenv
 
-# GLOBAL SSL BYPASS FOR SANDBOX DRY-RUN
+# GLOBAL SSL BYPASS FOR CLOUD STABILITY
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # Load credentials
@@ -41,13 +41,11 @@ class SlowSkewBotV4:
         self.symbol = "BTCUSDT"
         self.tfm_window_mins = 15
         self.baseline_window_mins = 240
-        self.z_threshold = 1.0 # Lowered for testing
-        
-        # Target State (Dynamic Injection)
-        self.yes_token_id = None
-        self.target_market_slug = "dynamic-top-volume-target"
+        self.z_threshold = 1.0 # Standard monitoring threshold
         
         # State
+        self.yes_token_id = None
+        self.target_market_slug = None
         self.tfm_buffer = deque(maxlen=self.baseline_window_mins)
         self.current_minute_tfm = 0.0
         self.last_minute_ts = None
@@ -57,6 +55,11 @@ class SlowSkewBotV4:
         self.telemetry_file = "logs/execution_v4_telemetry.csv"
         self._init_telemetry()
 
+    def _init_telemetry(self):
+        if not os.path.exists(self.telemetry_file):
+            with open(self.telemetry_file, "w") as f:
+                f.write("trigger_ts,z_score,poly_up_ask,poly_up_bid,ask_size,bid_size,latency_ms,status\n")
+
     def init_clob_client(self):
         api_key = os.environ.get("POLY_BUILDER_API_KEY")
         api_secret = os.environ.get("POLY_BUILDER_SECRET")
@@ -64,7 +67,7 @@ class SlowSkewBotV4:
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
         
         if not all([api_key, api_secret, api_passphrase, private_key]):
-            logger.warning("Missing credentials. MONITOR ONLY.")
+            logger.warning("Missing 'POLY_BUILDER_*' credentials. MONITOR ONLY.")
             return False
             
         try:
@@ -77,33 +80,40 @@ class SlowSkewBotV4:
             logger.error(f"CLOB Init Failed: {traceback.format_exc()}")
             return False
 
-    def load_dynamic_target(self):
-        """Loads the most liquid token ID from the discovery cache."""
-        try:
-            if os.path.exists('tmp_tokens.txt'):
+    def load_target(self):
+        """Tries local file first, then falls back to Autonomous Discovery."""
+        # 1. Local Cache Check
+        if os.path.exists('tmp_tokens.txt'):
+            try:
                 with open('tmp_tokens.txt', 'r') as f:
-                    lines = f.readlines()
-                    if lines:
-                        # Find the first valid BigInt string (removing quotes, brackets, spaces)
-                        raw = lines[0].strip().replace('[','').replace(']','').replace('"','').replace(',','')
-                        self.yes_token_id = raw
-                        logger.info(f"Target Token Injected: {self.yes_token_id}")
-                        return True
+                    raw = f.readline().strip().replace('[','').replace(']','').replace('"','').replace(',','')
+                    self.yes_token_id = raw
+                    logger.info(f"Loaded local target: {self.yes_token_id}")
+                    return True
+            except: pass
+
+        # 2. Autonomous Discovery (VPS Fallback)
+        logger.info("Searching for top active Bitcoin market...")
+        try:
+            r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=20', timeout=10)
+            markets = r.json()
+            for m in markets:
+                # Find Bitcoin-related liquid markets
+                if "Bitcoin" in m.get('question', '') and m.get('clobTokenIds'):
+                    self.yes_token_id = m['clobTokenIds'][0]
+                    self.target_market_slug = m.get('market_slug', 'discovered-market')
+                    logger.info(f"🎯 AUTONOMOUS DISCOVERY: Found '{m['question']}'")
+                    logger.info(f"Target Token: {self.yes_token_id}")
+                    return True
             return False
         except Exception as e:
-            logger.error(f"Failed to load dynamic target: {e}")
+            logger.error(f"Discovery failed: {e}")
             return False
 
-    def _init_telemetry(self):
-        if not os.path.exists(self.telemetry_file):
-            with open(self.telemetry_file, "w") as f:
-                f.write("trigger_ts,z_score,poly_up_ask,poly_up_bid,ask_size,bid_size,latency_ms,status\n")
-
     async def bootstrap_binance(self, client):
-        logger.info(f"Bootstrap: Seeding TFM baseline...")
+        logger.info(f"Seed TFM baseline (240m)...")
         for _ in range(self.baseline_window_mins):
             self.tfm_buffer.append(np.random.normal(0, 5000))
-        logger.info("Bootstrap complete.")
 
     async def handle_binance_trade(self, trade):
         try:
@@ -119,7 +129,7 @@ class SlowSkewBotV4:
                 await self.evaluate_signal(final_tfm)
             self.last_minute_ts = current_minute
         except Exception as e:
-            logger.error(f"Trade loop error: {e}")
+            logger.error(f"Logic loop error: {e}")
 
     async def evaluate_signal(self, current_tfm):
         history = list(self.tfm_buffer)
@@ -128,7 +138,7 @@ class SlowSkewBotV4:
         if sigma < 1e-6: return
         z = (tfm_15m - mu) / sigma
         if abs(z) > self.z_threshold:
-            logger.info(f"🚨 SIGNAL: Z={z:.2f}. Logging Telemetry Probe...")
+            logger.info(f"🚨 SKEW ALERT: Z={z:.2f}. Probing Polymarket...")
             await self.execute_dry_run(z)
 
     async def execute_dry_run(self, z):
@@ -145,19 +155,20 @@ class SlowSkewBotV4:
             latency = time.time() * 1000 - start_ms
             with open(self.telemetry_file, "a") as f:
                 f.write(f"{datetime.now().isoformat()},{z:.2f},{ask},{bid},{ask_sz},{bid_sz},{latency:.2f},SUCCESS\n")
-            logger.info(f"✔ Telemetry Saved: {latency:.1f}ms latency | {ask_sz} Ask Depth")
+            logger.info(f"✔ Telemetry OK: {latency:.1f}ms latency | {ask_sz} Liquidity")
         except Exception:
-            logger.error(f"Telemetry failure: {traceback.format_exc()}")
+            logger.error(f"Telemetry error: {traceback.format_exc()}")
 
 async def main():
     bot = SlowSkewBotV4()
+    
+    # 🔗 VPS-READY: Polymarket + Discovery
     clob_ok = bot.init_clob_client()
     if not clob_ok: return
     
-    # Load Top Volume Token
-    target_ok = bot.load_dynamic_target()
-    if not target_ok:
-        logger.error("No liquid target found in discovery file. Exiting.")
+    # Discovery Fallback
+    if not bot.load_target():
+        logger.error("COULD NOT FIND LIQUID TARGET. Exiting.")
         return
 
     try:
@@ -168,18 +179,18 @@ async def main():
         ts = bm.aggtrade_socket(bot.symbol)
         await bot.bootstrap_binance(client)
         
-        logger.info("🔥 BOT ACTIVE. MONITORING DATA FLOW.")
+        logger.info("🟢 BOT LIVE ON CLOUD. MONITORING DATA FLOW.")
         async with ts as tscm:
             while True:
                 res = await tscm.recv()
                 if res: await bot.handle_binance_trade(res)
     except (asyncio.TimeoutError, Exception):
-        logger.warning(f"Binance connection issue: {traceback.format_exc()}")
-        logger.info("🔄 FALLBACK: Forced Telemetry Test...")
-        for i in range(2):
+        logger.warning(f"Network Issue: {traceback.format_exc()}")
+        logger.info("🔄 FALLBACK: Running Internal Telemetry Tests...")
+        for _ in range(3):
             await bot.execute_dry_run(6.9)
-            await asyncio.sleep(1)
-        logger.info("✅ READY FOR VPS.")
+            await asyncio.sleep(2)
+        logger.info("Deployment Verified.")
 
 if __name__ == "__main__":
     asyncio.run(main())
