@@ -36,8 +36,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# PYTH CONFIG: BTC/USD Price Feed ID (V1 Stable)
-PYTH_HERMES_URL = "https://hermes.pyth.network/v1/latest_price_feeds?ids[]=0xe62df6c8b4a859e8fe9ad4715766d1737f53f8d9756117ac6667d0a2307827d9"
+# PYTH CONFIG: BTC/USD Price Feed ID
+BTC_FEED_ID = "0xe62df6c8b4a859e8fe9ad4715766d1737f53f8d9756117ac6667d0a2307827d9"
+PYTH_ENDPOINTS = [
+    "https://xc-mainnet.pyth.network/v2/updates/price/latest",
+    "https://hermes.pyth.network/v2/updates/price/latest"
+]
 
 class SlowSkewBotV4:
     def __init__(self):
@@ -71,11 +75,9 @@ class SlowSkewBotV4:
         api_secret = os.environ.get("POLY_BUILDER_SECRET")
         api_passphrase = os.environ.get("POLY_BUILDER_PASSPHRASE")
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
-        
         if not all([api_key, api_secret, api_passphrase, private_key]):
             logger.warning("Missing API credentials. MONITOR ONLY.")
             return False
-            
         try:
             creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
             self.clob_client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137, creds=creds)
@@ -91,7 +93,6 @@ class SlowSkewBotV4:
             logger.info(f"🛡️ MANUAL OVERRIDE: Using Token ID {manual_id}")
             self.yes_token_id = manual_id
             return True
-
         logger.info("Searching for LIQUID active Bitcoin market (Limit 50)...")
         try:
             r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=10)
@@ -108,7 +109,6 @@ class SlowSkewBotV4:
                         logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid}")
                         self.clob_client.get_order_book(tid)
                         self.yes_token_id = tid
-                        # Using full question as the identity label
                         self.target_market_name = m.get('question', 'Unknown Bitcoin Market')
                         logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_name}")
                         return True
@@ -129,37 +129,35 @@ class SlowSkewBotV4:
                     if resp.status == 200: return
             except: pass
 
-        webhook_url = os.environ.get("NOTIF_WEBHOOK_URL")
-        if not webhook_url: return
-        try:
-            payload = {"content": f"🔥 **{title}**\n{message}"}
-            async with session.post(webhook_url, json=payload, timeout=5) as resp: pass
-        except: pass
-
     async def get_pyth_price(self, session):
-        """Standardized V1 Price Parser."""
-        try:
-            async with session.get(PYTH_HERMES_URL, timeout=10) as resp:
-                if resp.status != 200:
-                    logger.error(f"Pyth API Error: {resp.status}")
-                    return None
-                data = await resp.json()
-                if isinstance(data, list) and len(data) > 0:
-                    p_info = data[0].get('price', {})
-                    raw_px = p_info.get('price')
-                    expo = p_info.get('expo')
-                    if raw_px is not None and expo is not None:
-                        return float(raw_px) * (10 ** int(expo))
-                return None
-        except Exception: return None
+        """Robust Multi-Endpoint Price Ingest."""
+        # Standard query sequence
+        params = {"ids[]": BTC_FEED_ID}
+        
+        for url in PYTH_ENDPOINTS:
+            try:
+                async with session.get(url, params=params, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        parsed_list = data.get('parsed', [])
+                        if parsed_list:
+                            p_info = parsed_list[0].get('price', {})
+                            raw_px = p_info.get('price')
+                            expo = p_info.get('expo')
+                            if raw_px is not None and expo is not None:
+                                return float(raw_px) * (10 ** int(expo))
+                    else:
+                        logger.warning(f"Pyth Endpoint {url} failed: {resp.status}")
+            except Exception as e:
+                logger.debug(f"Pyth URL {url} error: {e}")
+        return None
 
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
-            logger.info(f"🟢 CLOUD BOT ACTIVE. Target: {self.target_market_name}")
-            
-            # NOTIFICATION PROTOTYPE v23
+            logger.info("🟢 CLOUD BOT ACTIVE (Source: Enterprise XC-Mainnet).")
+            # Notification after target is confirmed
             await self.send_alert(session, "[SYSTEM ONLINE]", 
-                                 f"Slow Skew Bot is now sampling BTC data.\nTarget: `{self.target_market_name}`")
+                                 f"Bot sampling active.\nTarget: `{self.target_market_name}`")
             
             while True:
                 try:
@@ -176,7 +174,7 @@ class SlowSkewBotV4:
                         self.last_heartbeat = time.time()
                     
                     if time.time() - self.last_tg_heartbeat > 14400:
-                        await self.send_alert(session, "[HEARTBEAT]", f"Active. BTC: ${price:,.2f}")
+                        await self.send_alert(session, "[HEARTBEAT]", f"BTC: ${price:,.2f}")
                         self.last_tg_heartbeat = time.time()
 
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
@@ -207,7 +205,7 @@ class SlowSkewBotV4:
             await self.execute_dry_run(z)
             if abs(z) >= self.notif_threshold:
                 await self.send_alert(session, "HIGH MOMENTUM", 
-                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`\nMarket: {self.target_market_name}")
+                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`\nTarget: {self.target_market_name}")
 
     async def execute_dry_run(self, z):
         start_ms = time.time() * 1000
