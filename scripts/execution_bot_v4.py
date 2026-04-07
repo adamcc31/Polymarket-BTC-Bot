@@ -37,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # PYTH CONFIG: BTC/USD Price Feed ID
-PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest?ids[]=ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"
+PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest?ids[]=e62df6c8b4a859e8fe9ad4715766d1737f53f8d9756117ac6667d0a2307827d9"
 
 class SlowSkewBotV4:
     def __init__(self):
