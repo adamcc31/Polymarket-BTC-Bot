@@ -36,8 +36,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# PYTH CONFIG: BTC/USD Price Feed ID
-PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest?ids[]=0xe62df6c8b4a859e8fe9ad4715766d1737f53f8d9756117ac6667d0a2307827d9"
+# PYTH CONFIG: BTC/USD Price Feed ID (V2 Standard)
+PYTH_HERMES_URL = "https://hermes.pyth.network/v2/updates/price/latest?ids=0xe62df6c8b4a859e8fe9ad4715766d1737f53f8d9756117ac6667d0a2307827d9"
 
 class SlowSkewBotV4:
     def __init__(self):
@@ -49,7 +49,7 @@ class SlowSkewBotV4:
         
         # State
         self.yes_token_id = None
-        self.target_market_slug = None
+        self.target_market_slug = "Unknown"
         self.price_buffer = deque(maxlen=self.baseline_window_mins)
         self.last_minute_price = None
         self.last_minute_ts = None
@@ -73,12 +73,11 @@ class SlowSkewBotV4:
         private_key = os.environ.get("POLYMARKET_PRIVATE_KEY")
         
         if not all([api_key, api_secret, api_passphrase, private_key]):
-            logger.warning("Missing 'POLY_BUILDER_*' credentials. MONITOR ONLY.")
+            logger.warning("Missing API credentials. MONITOR ONLY.")
             return False
             
         try:
             creds = ApiCreds(api_key=api_key, api_secret=api_secret, api_passphrase=api_passphrase)
-            logger.info("Initializing Polymarket CLOB Client...")
             self.clob_client = ClobClient(host="https://clob.polymarket.com", key=private_key, chain_id=137, creds=creds)
             logger.info("Polymarket CLOB Client Initialized.")
             return True
@@ -92,14 +91,6 @@ class SlowSkewBotV4:
             logger.info(f"🛡️ MANUAL OVERRIDE: Using Token ID {manual_id}")
             self.yes_token_id = manual_id
             return True
-
-        if os.path.exists('tmp_tokens.txt'):
-            try:
-                with open('tmp_tokens.txt', 'r') as f:
-                    self.yes_token_id = f.readline().strip().replace('[','').replace(']','').replace('"','').replace(',','')
-                    logger.info(f"Loaded local target: {self.yes_token_id}")
-                    return True
-            except: pass
 
         logger.info("Searching for LIQUID active Bitcoin market (Limit 50)...")
         try:
@@ -117,8 +108,8 @@ class SlowSkewBotV4:
                         logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid}")
                         self.clob_client.get_order_book(tid)
                         self.yes_token_id = tid
-                        self.target_market_slug = m.get('market_slug')
-                        logger.info(f"🎯 LIQUID TARGET FOUND: {m['question']}")
+                        self.target_market_slug = m.get('market_slug', 'Unknown')
+                        logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_slug}")
                         return True
                     except: continue
             return False
@@ -145,63 +136,44 @@ class SlowSkewBotV4:
         except: pass
 
     async def get_pyth_price(self, session):
-        """Ultra-Robust Pyth Parser with Verbose Debugging."""
         try:
             async with session.get(PYTH_HERMES_URL, timeout=10) as resp:
                 if resp.status != 200:
-                    logger.error(f"Pyth API Error: {resp.status}")
+                    logger.error(f"Pyth API Error: {resp.status} (Raw Context: {resp.url})")
                     return None
                 data = await resp.json()
-                
-                # Deep Parse Logic
                 parsed_list = data.get('parsed', [])
-                if not parsed_list:
-                    logger.warning("Pyth returned empty price data.")
-                    return None
-                
+                if not parsed_list: return None
                 p_item = parsed_list[0]
                 p_info = p_item.get('price', {})
-                raw_px = p_info.get('price')
-                expo = p_info.get('expo')
-                
-                if raw_px is not None and expo is not None:
-                    price = float(raw_px) * (10 ** int(expo))
-                    return price
-                
-                logger.warning(f"Could not find price/expo in Pyth JSON: {data}")
-                return None
-        except Exception as e:
-            logger.error(f"Pyth Fetch Fatal: {e}")
-            return None
+                price = float(p_info.get('price', 0)) * (10 ** int(p_info.get('expo', 0)))
+                return price
+        except Exception: return None
 
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
-            logger.info("🟢 CLOUD BOT ACTIVE (Source: Pyth Network).")
-            # Initial Alert
+            logger.info(f"🟢 CLOUD BOT ACTIVE. Target: {self.target_market_slug}")
+            
+            # NOTIFICATION AFTER TARGET IS CONFIRMED
             await self.send_alert(session, "[SYSTEM ONLINE]", 
-                                 f"Slow Skew Bot v4 is now sampling BTC data.\nTarget: {self.target_market_slug}")
+                                 f"Slow Skew Bot v4 is sampling BTC data.\nTarget: `{self.target_market_slug}`")
             
             while True:
                 try:
-                    # Logging price attempt for cloud debugging
                     price = await self.get_pyth_price(session)
-                    
                     if not price: 
-                        logger.warning("Retrying Pyth Price Fetch in 2s...")
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(5)
                         continue
                         
                     now = datetime.now()
                     current_minute = now.replace(second=0, microsecond=0)
                     
-                    # 💓 CONSOLE HEARTBEAT (Always log on first run, then every 5 mins)
                     if self.last_heartbeat == 0 or (time.time() - self.last_heartbeat > 300):
                         logger.info(f"💓 HEARTBEAT: Price: ${price:,.2f} | Buffer: {len(self.price_buffer)}")
                         self.last_heartbeat = time.time()
                     
-                    # 📱 TELEGRAM HEARTBEAT (Every 4 Hours)
                     if time.time() - self.last_tg_heartbeat > 14400:
-                        await self.send_alert(session, "[HEARTBEAT]", f"System is healthy. BTC: ${price:,.2f}")
+                        await self.send_alert(session, "[HEARTBEAT]", f"Healthy. BTC: ${price:,.2f}")
                         self.last_tg_heartbeat = time.time()
 
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
@@ -212,28 +184,27 @@ class SlowSkewBotV4:
                     
                     if not self.last_minute_ts:
                         self.last_minute_price = price
-                        logger.info(f"Initial baseline price set: ${price:,.2f}")
+                        logger.info(f"Baseline set: ${price:,.2f}")
                     
                     self.last_minute_ts = current_minute
-                    await asyncio.sleep(10) # 10s sampling
+                    await asyncio.sleep(10)
                 except Exception as e:
-                    logger.error(f"Main Loop Fatal: {e}\n{traceback.format_exc()}")
+                    logger.error(f"Fatal: {e}")
                     await asyncio.sleep(5)
 
     async def evaluate_signal(self, session, current_price):
-        if len(self.price_buffer) < 2: return # Quick start for dry-run
+        if len(self.price_buffer) < 2: return
         history = list(self.price_buffer)
         mu, sigma = np.mean(history), np.std(history)
         if sigma < 1e-9: return
         z = (history[-1] - mu) / sigma
         
         if abs(z) > self.z_threshold:
-            logger.info(f"🚨 SKEW ALERT: Z={z:.2f}. Executing Telemetry Trace...")
+            logger.info(f"🚨 SKEW ALERT: Z={z:.2f}")
             await self.execute_dry_run(z)
-            
             if abs(z) >= self.notif_threshold:
-                await self.send_alert(session, "HIGH MOMENTUM DETECTED", 
-                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`\nStatus: Dry-Run Active.")
+                await self.send_alert(session, "HIGH MOMENTUM", 
+                                     f"Z-Score: `{z:.2f}`\nBTC: `${current_price:,.2f}`")
 
     async def execute_dry_run(self, z):
         start_ms = time.time() * 1000
@@ -249,15 +220,14 @@ class SlowSkewBotV4:
             latency = time.time() * 1000 - start_ms
             with open(self.telemetry_file, "a") as f:
                 f.write(f"{datetime.now().isoformat()},{z:.2f},{ask},{bid},{ask_sz},{bid_sz},{latency:.2f},SUCCESS\n")
-            logger.info(f"✔ Telemetry Saved: {latency:.1f}ms latency")
-        except Exception as e:
-            logger.warning(f"Telemetry log failed: {e}")
+            logger.info(f"✔ Telemetry OK: {latency:.1f}ms")
+        except Exception: pass
 
 async def main():
     bot = SlowSkewBotV4()
     if not bot.init_clob_client(): return
     if not bot.bootstrap_discovery():
-        logger.error("COULD NOT FIND LIQUID TARGET. Exiting.")
+        logger.error("COULD NOT FIND LIQUID TARGET.")
         return
     await bot.main_loop()
 
@@ -265,4 +235,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except Exception:
-        logger.error(f"System Fatal: {traceback.format_exc()}")
+        logger.error(f"Fatal: {traceback.format_exc()}")
