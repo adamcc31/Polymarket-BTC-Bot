@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import html
 import os
 import signal
 import sys
@@ -127,6 +128,9 @@ class TradingBot:
         # Dashboard state
         self._latest_signal = None
         self._latest_metrics = None
+        self._telegram_heartbeat_minutes = float(
+            self._config.get("telegram.heartbeat_minutes", 15.0)
+        )
 
     async def _send_telegram(self, title: str, message: str) -> None:
         """Telegram send helper (never raises)."""
@@ -134,6 +138,49 @@ class TradingBot:
             await self._telegram.send_message(title=title, message=message)
         except Exception:
             return
+
+    @staticmethod
+    def _tg_kv(data: dict) -> str:
+        lines = []
+        for k, v in data.items():
+            key = html.escape(str(k))
+            val = html.escape(str(v))
+            lines.append(f"<b>{key}</b>: {val}")
+        return "\n".join(lines)
+
+    async def _telegram_heartbeat_loop(self) -> None:
+        """Periodic market/watch heartbeat for operational visibility."""
+        interval_s = max(60.0, self._telegram_heartbeat_minutes * 60.0)
+        while self._running:
+            try:
+                market = self._discovery.active_market
+                btc_now = self._binance.latest_price
+                latest_signal = self._latest_signal
+                msg = {
+                    "session_id": self._dry_run.session_id,
+                    "mode": self._mode,
+                    "live_enabled": self._live_enabled,
+                    "market_id": getattr(market, "market_id", "N/A"),
+                    "strike_price": getattr(market, "strike_price", "N/A"),
+                    "ttr_minutes": round(getattr(market, "TTR_minutes", 0.0), 3)
+                    if market
+                    else "N/A",
+                    "btc_now": btc_now if btc_now is not None else "N/A",
+                    "signal": getattr(latest_signal, "signal", "N/A"),
+                    "edge_yes": round(getattr(latest_signal, "edge_yes", 0.0), 6)
+                    if latest_signal
+                    else "N/A",
+                    "edge_no": round(getattr(latest_signal, "edge_no", 0.0), 6)
+                    if latest_signal
+                    else "N/A",
+                }
+                await self._send_telegram(
+                    "HEARTBEAT / MARKET WATCH",
+                    self._tg_kv(msg),
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(interval_s)
 
     async def _dry_run_time_guard(self) -> None:
         """Stop after max duration unless live gate has already enabled live."""
@@ -192,12 +239,17 @@ class TradingBot:
 
         await self._send_telegram(
             "SYSTEM HEALTH START",
-            "Bot aktif di Railway.\n"
-            f"session_id={self._dry_run.session_id}\n"
-            f"requested_mode={self._requested_mode}\n"
-            f"effective_mode={self._mode}\n"
-            f"binance_health={binance_health}\n"
-            f"clob_state_present={clob_health is not None}\n",
+            self._tg_kv(
+                {
+                    "status": "ACTIVE",
+                    "session_id": self._dry_run.session_id,
+                    "requested_mode": self._requested_mode,
+                    "effective_mode": self._mode,
+                    "binance_connected": bool(self._binance.latest_price),
+                    "clob_state_present": clob_health is not None,
+                    "heartbeat_minutes": self._telegram_heartbeat_minutes,
+                }
+            ),
         )
 
         # Live mode gate (arm live client), but effective trading starts after go-live metrics pass.
@@ -218,6 +270,9 @@ class TradingBot:
             asyncio.create_task(self._discovery.start(), name="market_discovery"),
             asyncio.create_task(self._run_clob_loop(), name="clob_feed"),
             asyncio.create_task(self._run_dashboard(), name="dashboard"),
+            asyncio.create_task(
+                self._telegram_heartbeat_loop(), name="telegram_heartbeat"
+            ),
         ]
 
         # Dry-run must finish within max duration (default 48h).
@@ -357,16 +412,20 @@ class TradingBot:
             # Telegram: trade opened (paper order).
             asyncio.create_task(
                 self._send_telegram(
-                    "PAPER TRADE OPENED",
-                    "Paper trade dibuat (dry-run).\n"
-                    f"session_id={self._dry_run.session_id}\n"
-                    f"trade_id={trade.trade_id}\n"
-                    f"market_id={trade.market_id}\n"
-                    f"signal={trade.signal_type}\n"
-                    f"entry_price={trade.entry_price}\n"
-                    f"bet_size={trade.bet_size}\n"
-                    f"strike={trade.strike_price}\n"
-                    f"TTR_minutes={trade.TTR_at_entry}",
+                    "ORDER EXECUTION (DRY-RUN)",
+                    self._tg_kv(
+                        {
+                            "session_id": self._dry_run.session_id,
+                            "trade_id": trade.trade_id,
+                            "market_id": trade.market_id,
+                            "signal": trade.signal_type,
+                            "entry_price": trade.entry_price,
+                            "bet_size": trade.bet_size,
+                            "strike_price": trade.strike_price,
+                            "btc_now": self._binance.latest_price,
+                            "ttr_minutes": trade.TTR_at_entry,
+                        }
+                    ),
                 ),
                 name=f"tg_open_{trade.trade_id[:8]}",
             )
@@ -416,19 +475,23 @@ class TradingBot:
                 # Telegram: trade opened (shadow paper record for live).
                 asyncio.create_task(
                     self._send_telegram(
-                        "PAPER TRADE OPENED (SHADOW LIVE)",
-                        "Trade live disertai shadow paper-trade record.\n"
-                        f"session_id={self._dry_run.session_id}\n"
-                        f"trade_id={trade.trade_id}\n"
-                        f"market_id={trade.market_id}\n"
-                        f"signal={trade.signal_type}\n"
-                        f"entry_price={trade.entry_price}\n"
-                        f"bet_size={trade.bet_size}\n"
-                        f"strike={trade.strike_price}\n"
-                        f"TTR_minutes={trade.TTR_at_entry}\n"
-                        f"fill_status={status}\n"
-                        f"fill_price={fill_price}\n"
-                        f"filled_size={filled_size}\n",
+                        "ORDER EXECUTION (SHADOW LIVE)",
+                        self._tg_kv(
+                            {
+                                "session_id": self._dry_run.session_id,
+                                "trade_id": trade.trade_id,
+                                "market_id": trade.market_id,
+                                "signal": trade.signal_type,
+                                "entry_price": trade.entry_price,
+                                "bet_size": trade.bet_size,
+                                "strike_price": trade.strike_price,
+                                "btc_now": self._binance.latest_price,
+                                "ttr_minutes": trade.TTR_at_entry,
+                                "fill_status": status,
+                                "fill_price": fill_price,
+                                "filled_size": filled_size,
+                            }
+                        ),
                     ),
                     name=f"tg_open_live_{trade.trade_id[:8]}",
                 )
@@ -481,17 +544,20 @@ class TradingBot:
         # Telegram: trade resolved (PnL final for this paper/live record).
         asyncio.create_task(
             self._send_telegram(
-                "PAPER TRADE RESOLVED",
-                "Trade resolved.\n"
-                f"session_id={self._dry_run.session_id}\n"
-                f"trade_id={resolved.trade_id}\n"
-                f"market_id={resolved.market_id}\n"
-                f"signal={resolved.signal_type}\n"
-                f"outcome={resolved.outcome}\n"
-                f"entry_price={resolved.entry_price}\n"
-                f"btc_at_resolution={resolved.btc_at_resolution}\n"
-                f"pnl_usd={resolved.pnl_usd}\n"
-                f"capital_after={resolved.capital_after}\n",
+                "ORDER RESULT",
+                self._tg_kv(
+                    {
+                        "session_id": self._dry_run.session_id,
+                        "trade_id": resolved.trade_id,
+                        "market_id": resolved.market_id,
+                        "signal": resolved.signal_type,
+                        "outcome": resolved.outcome,
+                        "entry_price": resolved.entry_price,
+                        "btc_at_resolution": resolved.btc_at_resolution,
+                        "pnl_usd": resolved.pnl_usd,
+                        "capital_after": resolved.capital_after,
+                    }
+                ),
             ),
             name=f"tg_resolve_{resolved.trade_id[:8]}",
         )

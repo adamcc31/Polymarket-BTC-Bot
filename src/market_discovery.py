@@ -14,10 +14,12 @@ CRITICAL DESIGN NOTE (from validation):
 from __future__ import annotations
 
 import asyncio
+import json
+import math
 import re
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional, Literal
+from typing import Optional, Literal, Any
 
 import httpx
 import structlog
@@ -77,8 +79,13 @@ class MarketDiscovery:
         self._waiting_poll = config.get("market_discovery.waiting_poll_s", 60)
         self._min_ttr = config.get("market_discovery.min_ttr_to_discover", 5.0)
         self._late_ttr = config.get("market_discovery.late_ttr_minutes", 3.0)
+        self._candidate_pool_size = config.get("market_discovery.candidate_pool_size", 5)
+        self._rotation_score_buffer = config.get("market_discovery.rotation_score_buffer", 0.03)
+        self._target_yes_prob = config.get("market_discovery.target_yes_probability", 0.5)
+        self._target_ttr_minutes = config.get("market_discovery.target_ttr_minutes", 120.0)
         self._running = False
         self._last_log_time: float = 0.0
+        self._candidate_pool: list[dict[str, Any]] = []
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -224,37 +231,38 @@ class MarketDiscovery:
         if not self._active_market:
             return False
 
-        rotation_buffer = self._config.get(
-            "market_discovery.rotation_ttr_buffer_minutes", 5.0
-        )
-        current_ttr = self._active_market.TTR_minutes
-
         candidates = await self._query_candidates()
         if not candidates:
             return False
 
-        # Stage 1 — TTR gate: must have meaningfully more time than current market
+        current = next(
+            (c for c in candidates if c["market"].market_id == self._active_market.market_id),
+            None,
+        )
+        current_score = current["score"] if current else -1.0
+
         better = [
-            c for c in candidates
-            if c["market"].TTR_minutes > current_ttr + rotation_buffer
-            and c["market"].market_id != self._active_market.market_id
+            c
+            for c in candidates
+            if c["market"].market_id != self._active_market.market_id
+            and c["score"] > current_score + self._rotation_score_buffer
         ]
 
         if not better:
             return False
 
-        # Stage 2 — liquidity tiebreaker: highest Gamma volume wins
-        best = max(better, key=lambda c: c["volume"])
+        best = max(better, key=lambda c: c["score"])
         new_market = best["market"]
 
         logger.info(
             "market_rotated",
             old_market_id=self._active_market.market_id,
-            old_ttr_minutes=round(current_ttr, 2),
+            old_ttr_minutes=round(self._active_market.TTR_minutes, 2),
             new_market_id=new_market.market_id,
             new_ttr_minutes=round(new_market.TTR_minutes, 2),
             new_volume_usd=round(best["volume"], 2),
-            ttr_gain_minutes=round(new_market.TTR_minutes - current_ttr, 2),
+            old_score=round(current_score, 4),
+            new_score=round(best["score"], 4),
         )
 
         self._active_market = new_market
@@ -270,8 +278,15 @@ class MarketDiscovery:
         candidates = await self._query_candidates()
         if not candidates:
             return None
-        # Pick highest volume among those with sufficient TTR (already filtered)
-        best = max(candidates, key=lambda c: c["volume"])
+        best = max(candidates, key=lambda c: c["score"])
+        self._candidate_pool = candidates[: self._candidate_pool_size]
+        logger.info(
+            "candidate_pool_ranked",
+            pool_size=len(self._candidate_pool),
+            top_market_id=best["market"].market_id,
+            top_score=round(best["score"], 4),
+            top_volume=round(best["volume"], 2),
+        )
         return best["market"]
 
     async def _query_candidates(self) -> list[dict]:
@@ -346,13 +361,23 @@ class MarketDiscovery:
                         ):
                             continue
 
-                        candidates.append({"market": parsed, "volume": volume})
+                        yes_prob = self._extract_yes_probability(m)
+                        score = self._score_candidate(parsed, volume, yes_prob)
+                        candidates.append(
+                            {
+                                "market": parsed,
+                                "volume": volume,
+                                "yes_prob": yes_prob,
+                                "score": score,
+                            }
+                        )
 
                 if not candidates and skipped_reasons:
                     logger.info("discovery_skipped_candidates", 
                                 top_reasons=skipped_reasons,
                                 total_markets_scanned=len(markets))
 
+                candidates.sort(key=lambda c: c["score"], reverse=True)
                 return candidates
 
         except httpx.HTTPError as e:
@@ -493,6 +518,52 @@ class MarketDiscovery:
                 except ValueError:
                     continue
         return None
+
+    def _extract_yes_probability(self, market_data: dict) -> Optional[float]:
+        """Best-effort parse YES implied probability from Gamma payload."""
+        outcomes_raw = market_data.get("outcomes")
+        prices_raw = market_data.get("outcomePrices")
+        try:
+            outcomes = outcomes_raw if isinstance(outcomes_raw, list) else json.loads(outcomes_raw or "[]")
+            prices = prices_raw if isinstance(prices_raw, list) else json.loads(prices_raw or "[]")
+            if not isinstance(outcomes, list) or not isinstance(prices, list):
+                return None
+            idx = None
+            for i, name in enumerate(outcomes):
+                if str(name).strip().upper() == "YES":
+                    idx = i
+                    break
+            if idx is None or idx >= len(prices):
+                return None
+            p = float(prices[idx])
+            return p if 0.0 <= p <= 1.0 else None
+        except Exception:
+            return None
+
+    def _score_candidate(
+        self,
+        market: ActiveMarket,
+        volume_24h: float,
+        yes_prob: Optional[float],
+    ) -> float:
+        """
+        Rank multiple tradable markets:
+        - liquidity signal from log(volume)
+        - probability proximity to configurable target (default 0.5)
+        - TTR proximity to target duration
+        """
+        volume_score = max(0.0, min(1.0, math.log1p(max(0.0, volume_24h)) / 12.0))
+
+        if yes_prob is None:
+            prob_score = 0.5
+        else:
+            prob_score = max(0.0, 1.0 - abs(yes_prob - self._target_yes_prob) * 2.0)
+
+        ttr_delta = abs(market.TTR_minutes - self._target_ttr_minutes)
+        ttr_score = max(0.0, 1.0 - (ttr_delta / max(30.0, self._target_ttr_minutes)))
+
+        # Weighted sum, conservative and monotone.
+        return (0.45 * volume_score) + (0.35 * prob_score) + (0.20 * ttr_score)
 
     @staticmethod
     def _extract_token_ids(tokens: list, market_data: dict) -> dict:
