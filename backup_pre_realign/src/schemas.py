@@ -33,35 +33,6 @@ class ActiveMarket(BaseModel):
     T_open: datetime = Field(..., description="Market open time (UTC)")
     T_resolution: datetime = Field(..., description="Resolution time (UTC)")
     TTR_minutes: float = Field(..., description="Time-to-resolution in minutes at discovery")
-    settlement_exchange: Literal[
-        "BINANCE", "PYTH", "COINBASE", "UMA", "UNKNOWN"
-    ] = Field(
-        default="UNKNOWN",
-        description=(
-            "Settlement oracle/exchange source for the binary outcome (e.g. 'BINANCE'). "
-            "Trading alpha must only be taken when probability is computed against the "
-            "same settlement source."
-        ),
-    )
-    settlement_instrument: Optional[str] = Field(
-        default=None,
-        description=(
-            "Settlement instrument identifier (e.g. 'BTCUSDT'), if known. "
-            "Used for fetching the correct settlement price."
-        ),
-    )
-    settlement_granularity: Literal["1m", "unknown"] = Field(
-        default="unknown",
-        description=(
-            "Settlement candle granularity for exchange-based settlement (e.g. '1m')."
-        ),
-    )
-    settlement_price_type: Literal["close", "vwap", "unknown"] = Field(
-        default="unknown",
-        description=(
-            "Settlement price type derived from the exchange candle (e.g. 'close', 'vwap')."
-        ),
-    )
     clob_token_ids: Dict[str, str] = Field(
         ..., description='{"YES": "0x...", "NO": "0x..."}'
     )
@@ -138,27 +109,12 @@ class SignalResult(BaseModel):
 
     signal: Literal["BUY_YES", "BUY_NO", "ABSTAIN"]
     abstain_reason: Optional[
-        Literal[
-            "TTR_PHASE",
-            "REGIME_BLOCK",
-            "LIQUIDITY_BLOCK",
-            "NO_EDGE",
-            "NO_TRADE_ZONE",
-            "BASIS_RISK_BLOCK",
-            "BASIS_RISK_INFLATED",
-        ]
+        Literal["TTR_PHASE", "REGIME_BLOCK", "LIQUIDITY_BLOCK", "NO_EDGE"]
     ] = None
     P_model: float = Field(..., ge=0.0, le=1.0)
-    uncertainty_u: float = Field(
-        ...,
-        ge=0.0,
-        description="Probability-point uncertainty buffer used for conservative edge and sizing",
-    )
     edge_yes: float
     edge_no: float
-    clob_yes_bid: float
     clob_yes_ask: float
-    clob_no_bid: float
     clob_no_ask: float
     TTR_minutes: float
     strike_price: float
@@ -322,15 +278,8 @@ class StalenessReport(BaseModel):
 class FillResult(BaseModel):
     """Result of order fill monitoring."""
 
-    status: Literal[
-        "FILLED",
-        "PARTIALLY_FILLED",
-        "FAILED",
-        "TIMEOUT_CANCELLED",
-    ]
+    status: Literal["FILLED", "FAILED", "TIMEOUT_CANCELLED"]
     fill_price: Optional[float] = None
-    filled_size: Optional[float] = None
-    remaining_size: Optional[float] = None
     reason: Optional[str] = None
     order_id: Optional[str] = None
 

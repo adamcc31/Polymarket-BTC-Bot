@@ -26,5 +26,5 @@ RUN mkdir -p logs
 ENV PYTHONUNBUFFERED=1
 ENV TARGET_MARKET_SLUG="will-the-price-of-bitcoin-be-above-70000-on-april-7"
 
-# Perintah untuk menjalankan bot (Gunakan scripts/execution_bot_v4.py)
-CMD ["python", "scripts/execution_bot_v4.py"]
+# Perintah untuk menjalankan bot (engine baru; default dry-run)
+CMD ["python", "main.py", "--mode", "dry-run"]

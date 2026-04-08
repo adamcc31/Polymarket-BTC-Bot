@@ -17,7 +17,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional, Literal
+from typing import Optional
 
 import httpx
 import structlog
@@ -316,20 +316,6 @@ class MarketDiscovery:
 
                     parsed = self._parse_market(m)
                     if parsed and parsed.TTR_minutes >= self._min_ttr:
-                        # Basis-risk policy: only hard-skip if explicitly configured.
-                        non_binance_policy = self._config.get(
-                            "settlement.non_binance_policy", "uncertainty_inflate"
-                        )
-                        non_binance_is_mismatch = not (
-                            parsed.settlement_exchange == "BINANCE"
-                            and parsed.settlement_granularity == "1m"
-                        )
-                        if (
-                            non_binance_policy == "abstain"
-                            and non_binance_is_mismatch
-                        ):
-                            continue
-
                         candidates.append({"market": parsed, "volume": volume})
 
                 if not candidates and skipped_reasons:
@@ -408,13 +394,8 @@ class MarketDiscovery:
             tokens = market_data.get("tokens", [])
             clob_token_ids = self._extract_token_ids(tokens, market_data)
 
-            (
-                settlement_exchange,
-                settlement_instrument,
-                settlement_granularity,
-                settlement_price_type,
-                resolution_source,
-            ) = self._extract_settlement_descriptor(market_data)
+            # Try to determine resolution source from rules
+            resolution_source = self._extract_resolution_source(market_data)
 
             return ActiveMarket(
                 market_id=market_id,
@@ -424,10 +405,6 @@ class MarketDiscovery:
                 T_resolution=T_resolution,
                 TTR_minutes=ttr_minutes,
                 clob_token_ids=clob_token_ids,
-                settlement_exchange=settlement_exchange,
-                settlement_instrument=settlement_instrument,
-                settlement_granularity=settlement_granularity,
-                settlement_price_type=settlement_price_type,
                 resolution_source=resolution_source,
             )
 
@@ -483,20 +460,10 @@ class MarketDiscovery:
         return token_ids
 
     @staticmethod
-    def _extract_settlement_descriptor(
-        market_data: dict,
-    ) -> tuple[
-        str,
-        Optional[str],
-        Literal["1m", "unknown"],
-        Literal["close", "vwap", "unknown"],
-        Optional[str],
-    ]:
+    def _extract_resolution_source(market_data: dict) -> Optional[str]:
         """
-        Extract structured settlement descriptor from market rules/description.
-
-        This is a basis-risk gate input. If we cannot prove the exchange/granularity,
-        we mark it as `unknown` so downstream logic can widen uncertainty or abstain.
+        Try to determine resolution oracle from market rules/description.
+        Oracle can be Pyth, Coinbase, CoinGecko, etc.
         """
         rules = (
             market_data.get("description", "")
@@ -506,56 +473,17 @@ class MarketDiscovery:
             + str(market_data.get("uma_resolution_rules", ""))
         ).lower()
 
-        # Defaults
-        settlement_exchange: str = "UNKNOWN"
-        settlement_instrument: Optional[str] = "BTCUSDT"
-        settlement_granularity: Literal["1m", "unknown"] = "unknown"
-        settlement_price_type: Literal["close", "vwap", "unknown"] = "unknown"
-        resolution_source: Optional[str] = None
-
-        if "binance" in rules:
-            settlement_exchange = "BINANCE"
-            resolution_source = "Binance"
-            settlement_instrument = "BTCUSDT"
-
-            if "1m" in rules or "1 minute" in rules or "1-minute" in rules:
-                settlement_granularity = "1m"
-
-            settlement_price_type = "vwap" if "vwap" in rules else "close"
-            return (
-                settlement_exchange,
-                settlement_instrument,
-                settlement_granularity,
-                settlement_price_type,
-                resolution_source,
-            )
-
         if "pyth" in rules:
-            settlement_exchange = "PYTH"
-            resolution_source = "Pyth"
+            return "Pyth"
         elif "coinbase" in rules:
-            settlement_exchange = "COINBASE"
-            resolution_source = "Coinbase"
+            return "Coinbase"
         elif "coingecko" in rules:
-            settlement_exchange = "COINBASE"
-            resolution_source = "CoinGecko"
+            return "CoinGecko"
+        elif "binance" in rules:
+            return "Binance"
         elif "uma" in rules:
-            settlement_exchange = "UMA"
-            resolution_source = "UMA"
-
-        return (
-            settlement_exchange,
-            settlement_instrument,
-            settlement_granularity,
-            settlement_price_type,
-            resolution_source,
-        )
-
-    @staticmethod
-    def _extract_resolution_source(market_data: dict) -> Optional[str]:
-        """Backwards-compatible wrapper: return only the resolution oracle name."""
-        *_rest, resolution_source = MarketDiscovery._extract_settlement_descriptor(market_data)
-        return resolution_source
+            return "UMA"
+        return None
 
     @staticmethod
     def _parse_timestamp(ts: str) -> Optional[datetime]:

@@ -2,7 +2,7 @@
 builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "python scripts/execution_bot_v4.py"
+startCommand = "python main.py --mode dry-run"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
 
@@ -10,4 +10,4 @@ restartPolicyMaxRetries = 3
 mountPath = "/app/logs"
 
 [environments.production]
-startCommand = "python scripts/execution_bot_v4.py"
+startCommand = "python main.py --mode dry-run"

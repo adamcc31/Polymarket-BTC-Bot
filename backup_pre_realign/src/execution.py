@@ -178,36 +178,9 @@ class ExecutionClient:
         if not token_id:
             return OrderRejected(reason="MISSING_TOKEN_ID")
 
-        # ── Maker vs taker-like pricing ────────────────────────
-        if signal.signal == "BUY_YES":
-            clob_ask = signal.clob_yes_ask
-            clob_bid = signal.clob_yes_bid
-            edge = signal.edge_yes
-        else:
-            clob_ask = signal.clob_no_ask
-            clob_bid = signal.clob_no_bid
-            edge = signal.edge_no
-
-        taker_edge_threshold = float(self._config.get("execution.taker_edge_threshold", 0.08))
-        taker_price_buffer = float(self._config.get("execution.taker_price_buffer", 0.002))
-        maker_price_step = float(self._config.get("execution.maker_price_step", 0.0005))
-        maker_price_epsilon = float(self._config.get("execution.maker_price_epsilon", 0.0001))
-
-        spread = clob_ask - clob_bid
-        use_taker_like = edge >= taker_edge_threshold and spread > 0
-
-        if use_taker_like:
-            # Cross more aggressively only when edge is strong.
-            order_price = round(clob_ask + taker_price_buffer, 4)
-            exec_mode = "TAKER_LIKE"
-        else:
-            # Post passively: keep limit price below ask when possible.
-            candidate = clob_bid + maker_price_step
-            candidate = min(candidate, clob_ask - maker_price_epsilon)
-            if candidate <= 0:
-                candidate = clob_bid
-            order_price = round(candidate, 4)
-            exec_mode = "MAKER_POST"
+        # Order price: ask + slippage buffer
+        clob_ask = signal.clob_yes_ask if signal.signal == "BUY_YES" else signal.clob_no_ask
+        order_price = round(clob_ask + 0.002, 4)  # 0.2 pp buffer
 
         try:
             logger.info(
@@ -217,10 +190,6 @@ class ExecutionClient:
                 size=approved_bet.bet_size,
                 side="BUY",
                 signal=signal.signal,
-                exec_mode=exec_mode,
-                clob_bid=clob_bid,
-                clob_ask=clob_ask,
-                edge=round(edge, 6),
             )
 
             order = self._clob_client.create_and_post_order(
@@ -247,9 +216,6 @@ class ExecutionClient:
         import time
 
         start = time.time()
-        last_avg_price: Optional[float] = None
-        last_filled_size: Optional[float] = None
-        last_remaining_size: Optional[float] = None
 
         while (time.time() - start) < self.ORDER_TIMEOUT_S:
             try:
@@ -257,53 +223,15 @@ class ExecutionClient:
                 status = order_status.get("status", "").upper()
 
                 if status == "FILLED":
-                    fill_price = float(order_status.get("avg_price", order_status.get("averagePrice", 0)) or 0)
-                    filled_size = self._coerce_float(
-                        order_status.get("executed_size")
-                        or order_status.get("filled_size")
-                        or order_status.get("executedSize")
-                        or order_status.get("filledSize")
-                        or 0
-                    )
+                    fill_price = float(order_status.get("avg_price", 0))
                     logger.info("order_filled", order_id=order_id, fill_price=fill_price)
                     return FillResult(
                         status="FILLED",
                         fill_price=fill_price,
-                        filled_size=filled_size,
-                        remaining_size=0.0,
                         order_id=order_id,
                     )
-                if status in ("PARTIALLY_FILLED", "PARTIALLYFILLED"):
-                    last_avg_price = float(
-                        order_status.get("avg_price", order_status.get("averagePrice", 0)) or 0
-                    )
-                    last_filled_size = self._coerce_float(
-                        order_status.get("executed_size")
-                        or order_status.get("filled_size")
-                        or order_status.get("executedSize")
-                        or order_status.get("filledSize")
-                        or 0
-                    )
-                    last_remaining_size = self._coerce_float(
-                        order_status.get("remaining_size")
-                        or order_status.get("remainingSize")
-                        or 0
-                    )
-                    # Keep monitoring until filled or timeout/cancel.
                 elif status in ("CANCELLED", "REJECTED"):
-                    # If we have a partial fill history, report partial instead of total failure.
-                    if last_filled_size is not None and last_filled_size > 0:
-                        return FillResult(
-                            status="PARTIALLY_FILLED",
-                            fill_price=last_avg_price,
-                            filled_size=last_filled_size,
-                            remaining_size=last_remaining_size,
-                            reason=status,
-                            order_id=order_id,
-                        )
-                    return FillResult(
-                        status="FAILED", reason=status, order_id=order_id
-                    )
+                    return FillResult(status="FAILED", reason=status, order_id=order_id)
 
             except Exception as e:
                 logger.warning("fill_monitor_error", error=str(e))
@@ -317,25 +245,7 @@ class ExecutionClient:
         except Exception as e:
             logger.error("cancel_error", order_id=order_id, error=str(e))
 
-        if last_filled_size is not None and last_filled_size > 0:
-            return FillResult(
-                status="PARTIALLY_FILLED",
-                fill_price=last_avg_price,
-                filled_size=last_filled_size,
-                remaining_size=last_remaining_size,
-                reason="TIMEOUT_CANCELLED",
-                order_id=order_id,
-            )
         return FillResult(status="TIMEOUT_CANCELLED", order_id=order_id)
-
-    @staticmethod
-    def _coerce_float(v: object) -> Optional[float]:
-        try:
-            if v is None:
-                return None
-            return float(v)
-        except (TypeError, ValueError):
-            return None
 
     # ── Post-Resolution ───────────────────────────────────────
 

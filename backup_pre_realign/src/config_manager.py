@@ -14,12 +14,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-try:
-    import structlog  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
-    structlog = None
+import structlog
 
-logger = structlog.get_logger(__name__) if structlog else logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.json"
 

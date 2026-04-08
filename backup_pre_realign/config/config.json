@@ -38,8 +38,7 @@
     "go_live_min_total_trades": 100,
     "abort_consecutive_fail": 3,
     "abort_win_rate_threshold": 0.48,
-    "abort_consecutive_losses": 6,
-    "max_duration_hours": 48
+    "abort_consecutive_losses": 6
   },
   "model": {
     "retrain_win_rate_trigger": 0.50,
@@ -74,9 +73,5 @@
     "rotation_ttr_buffer_minutes": 5.0,
     "tag_slug": "bitcoin",
     "min_volume_24hr": 1000.0
-  },
-  "telegram": {
-    "enabled": true,
-    "timeout_seconds": 10.0
   }
 }

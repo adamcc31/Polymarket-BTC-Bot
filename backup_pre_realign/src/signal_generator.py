@@ -15,11 +15,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-try:
-    import structlog  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
-    structlog = None
-import logging
+import structlog
 
 from src.config_manager import ConfigManager
 from src.schemas import (
@@ -30,7 +26,7 @@ from src.schemas import (
     SignalResult,
 )
 
-logger = structlog.get_logger(__name__) if structlog else logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class SignalGenerator:
@@ -46,7 +42,6 @@ class SignalGenerator:
     def evaluate(
         self,
         P_model: float,
-        uncertainty_u: float,
         clob_state: CLOBState,
         active_market: ActiveMarket,
         feature_vector: FeatureVector,
@@ -64,10 +59,9 @@ class SignalGenerator:
 
         # Common fields
         base = {
+            "P_model": P_model,
             "clob_yes_ask": clob_state.yes_ask,
-            "clob_yes_bid": clob_state.yes_bid,
             "clob_no_ask": clob_state.no_ask,
-            "clob_no_bid": clob_state.no_bid,
             "TTR_minutes": metadata.TTR_minutes,
             "strike_price": active_market.strike_price,
             "current_price": metadata.current_btc_price,
@@ -76,75 +70,6 @@ class SignalGenerator:
             "timestamp": now,
             "features": features_dict,
         }
-
-        # Basis-risk adjustment:
-        # If settlement source is not Binance 1m close, probability accuracy
-        # degrades. We either abstain near resolution or inflate u.
-        basis_mismatch = not (
-            active_market.settlement_exchange == "BINANCE"
-            and active_market.settlement_granularity == "1m"
-        )
-        non_binance_policy = self._config.get(
-            "settlement.non_binance_policy", "uncertainty_inflate"
-        )
-        non_binance_abstain_ttr_min = float(
-            self._config.get("settlement.non_binance_abstain_ttr_min", 6.0)
-        )
-        u_used = uncertainty_u
-        if basis_mismatch:
-            if non_binance_policy == "abstain":
-                # If configured to hard-abstain, stop immediately regardless of TTR.
-                edge_yes = P_model - clob_state.yes_ask
-                edge_no = (1.0 - P_model) - clob_state.no_ask
-                return SignalResult(
-                    signal="ABSTAIN",
-                    abstain_reason="BASIS_RISK_BLOCK",
-                    P_model=P_model,
-                    uncertainty_u=uncertainty_u,
-                    edge_yes=edge_yes,
-                    edge_no=edge_no,
-                    clob_yes_ask=clob_state.yes_ask,
-                    clob_yes_bid=clob_state.yes_bid,
-                    clob_no_ask=clob_state.no_ask,
-                    clob_no_bid=clob_state.no_bid,
-                    TTR_minutes=metadata.TTR_minutes,
-                    strike_price=active_market.strike_price,
-                    current_price=metadata.current_btc_price,
-                    strike_distance=features_dict.get("strike_distance_pct", 0.0),
-                    market_id=active_market.market_id,
-                    timestamp=now,
-                    features=features_dict,
-                )
-
-            # Allow trading but with uncertainty inflation. If we are too close to
-            # resolution, halt to avoid binary flip risk.
-            if metadata.TTR_minutes < non_binance_abstain_ttr_min:
-                edge_yes = P_model - clob_state.yes_ask
-                edge_no = (1.0 - P_model) - clob_state.no_ask
-                return SignalResult(
-                    signal="ABSTAIN",
-                    abstain_reason="BASIS_RISK_BLOCK",
-                    P_model=P_model,
-                    uncertainty_u=uncertainty_u,
-                    edge_yes=edge_yes,
-                    edge_no=edge_no,
-                    clob_yes_ask=clob_state.yes_ask,
-                    clob_yes_bid=clob_state.yes_bid,
-                    clob_no_ask=clob_state.no_ask,
-                    clob_no_bid=clob_state.no_bid,
-                    TTR_minutes=metadata.TTR_minutes,
-                    strike_price=active_market.strike_price,
-                    current_price=metadata.current_btc_price,
-                    strike_distance=features_dict.get("strike_distance_pct", 0.0),
-                    market_id=active_market.market_id,
-                    timestamp=now,
-                    features=features_dict,
-                )
-
-            non_binance_u_mult = float(
-                self._config.get("settlement.non_binance_u_multiplier", 2.0)
-            )
-            u_used = uncertainty_u * non_binance_u_mult
 
         # ── STEP 1: TTR GATE ─────────────────────────────────
         ttr_min = self._config.get("signal.ttr_min_minutes", 5.0)
@@ -162,8 +87,6 @@ class SignalGenerator:
             return SignalResult(
                 signal="ABSTAIN",
                 abstain_reason="TTR_PHASE",
-                P_model=P_model,
-                uncertainty_u=u_used,
                 edge_yes=edge_yes,
                 edge_no=edge_no,
                 **base,
@@ -200,8 +123,6 @@ class SignalGenerator:
             return SignalResult(
                 signal="ABSTAIN",
                 abstain_reason="REGIME_BLOCK",
-                P_model=P_model,
-                uncertainty_u=u_used,
                 edge_yes=edge_yes,
                 edge_no=edge_no,
                 **base,
@@ -222,34 +143,14 @@ class SignalGenerator:
             return SignalResult(
                 signal="ABSTAIN",
                 abstain_reason="LIQUIDITY_BLOCK",
-                P_model=P_model,
-                uncertainty_u=u_used,
                 edge_yes=edge_yes,
                 edge_no=edge_no,
                 **base,
             )
 
         # ── STEP 4: MISPRICING CALCULATION ───────────────────
-        edge_yes_raw = P_model - clob_state.yes_ask
-        edge_no_raw = (1.0 - P_model) - clob_state.no_ask
-
-        # Conservative edges: subtract uncertainty buffer.
-        edge_yes = edge_yes_raw - u_used
-        edge_no = edge_no_raw - u_used
-
-        # ── No-trade zone around fair (prevents churn) ─────────
-        no_trade_zone_p = float(self._config.get("signal.no_trade_deadband", 0.02))
-        mid_yes = (clob_state.yes_bid + clob_state.yes_ask) / 2.0
-        if abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
-            return SignalResult(
-                signal="ABSTAIN",
-                abstain_reason="NO_TRADE_ZONE",
-                P_model=P_model,
-                uncertainty_u=u_used,
-                edge_yes=edge_yes,
-                edge_no=edge_no,
-                **base,
-            )
+        edge_yes = P_model - clob_state.yes_ask
+        edge_no = (1.0 - P_model) - clob_state.no_ask
 
         # ── STEP 5: MARGIN OF SAFETY CHECK ───────────────────
         margin = self._config.get("signal.margin_of_safety", 0.05)
@@ -264,8 +165,6 @@ class SignalGenerator:
             return SignalResult(
                 signal="ABSTAIN",
                 abstain_reason="NO_EDGE",
-                P_model=P_model,
-                uncertainty_u=u_used,
                 edge_yes=edge_yes,
                 edge_no=edge_no,
                 **base,
@@ -293,8 +192,6 @@ class SignalGenerator:
         return SignalResult(
             signal=signal,
             abstain_reason=None,
-            P_model=P_model,
-            uncertainty_u=u_used,
             edge_yes=edge_yes,
             edge_no=edge_no,
             **base,

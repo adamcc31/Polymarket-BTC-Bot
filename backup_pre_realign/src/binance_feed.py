@@ -17,18 +17,14 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import httpx
-try:
-    import structlog  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
-    structlog = None
-import logging
+import structlog
 import websockets
 from websockets.exceptions import ConnectionClosed
 
 from src.config_manager import ConfigManager
 from src.schemas import WSHealthMetrics
 
-logger = structlog.get_logger(__name__) if structlog else logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class BinanceFeed:
@@ -46,7 +42,6 @@ class BinanceFeed:
         "btcusdt@depth20@100ms",
         "btcusdt@aggTrade",
         "btcusdt@kline_15m",
-        "btcusdt@kline_1m",
     ]
 
     def __init__(self, config: ConfigManager) -> None:
@@ -54,7 +49,6 @@ class BinanceFeed:
         self._ws_base_url = config.get("binance.ws_base_url", "wss://stream.binance.com:9443/stream")
         self._rest_base_url = config.get("binance.rest_base_url", "https://api.binance.com")
         self._buffer_capacity = config.get("binance.buffer_capacity", 500)
-        self._buffer_capacity_1m = config.get("binance.buffer_capacity_1m", 3000)
         self._stale_threshold_s = config.get("binance.stale_threshold_s", 30)
 
         # Reconnection parameters
@@ -65,9 +59,6 @@ class BinanceFeed:
 
         # Circular buffers — thread-safe deques
         self._ohlcv_buffer: Deque[Dict[str, Any]] = deque(maxlen=self._buffer_capacity)
-        self._ohlcv_1m_buffer: Deque[Dict[str, Any]] = deque(
-            maxlen=self._buffer_capacity_1m
-        )
         self._ob_buffer: Deque[Dict[str, Any]] = deque(maxlen=self._buffer_capacity)
 
         # Trade flow accumulator for TFM
@@ -104,11 +95,6 @@ class BinanceFeed:
     def ohlcv_buffer(self) -> List[Dict[str, Any]]:
         """OHLCV bar history as list (newest last)."""
         return list(self._ohlcv_buffer)
-
-    @property
-    def ohlcv_1m_buffer(self) -> List[Dict[str, Any]]:
-        """1-minute OHLCV bar history as list (newest last)."""
-        return list(self._ohlcv_1m_buffer)
 
     @property
     def ob_buffer(self) -> List[Dict[str, Any]]:
@@ -189,75 +175,6 @@ class BinanceFeed:
                 if (bar := self._parse_rest_kline(k)) and self._validate_bar(bar)
             ]
 
-    async def get_1m_settlement_price(
-        self,
-        resolution_time: datetime,
-        price_type: str = "close",
-        symbol: str = "BTCUSDT",
-    ) -> Optional[float]:
-        """
-        Return the Binance 1-minute candle price aligned to `resolution_time`.
-
-        Settlement correctness requirement:
-        - We choose the 1m candle where: candle_open_time <= resolution_time < candle_close_time
-        - For now, only `close` is supported. If `price_type` is unknown, we fall back to `close`.
-        """
-        if resolution_time.tzinfo is None:
-            resolution_time = resolution_time.replace(tzinfo=timezone.utc)
-
-        res_ms = int(resolution_time.timestamp() * 1000)
-        candle_open_ms = (res_ms // 60000) * 60000
-        candle_close_ms = candle_open_ms + 60000
-
-        # Simple per-minute cache to avoid duplicate REST calls.
-        if (
-            hasattr(self, "_last_settlement_candle_open_ms")
-            and getattr(self, "_last_settlement_candle_open_ms") == candle_open_ms
-        ):
-            return getattr(self, "_last_settlement_price", None)
-
-        url = f"{self._rest_base_url}/api/v3/klines"
-        params = {
-            "symbol": symbol,
-            "interval": "1m",
-            "startTime": candle_open_ms,
-            "limit": 2,
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            klines = resp.json()
-
-        bars: list[Dict[str, Any]] = []
-        for k in klines:
-            bar = self._parse_rest_kline(k)
-            if bar and self._validate_bar(bar):
-                bars.append(bar)
-
-        chosen: Optional[Dict[str, Any]] = None
-        for bar in bars:
-            if bar["open_time"] <= res_ms < bar["close_time"]:
-                chosen = bar
-                break
-
-        if chosen is None and bars:
-            # Fallback: use first bar if we couldn't match the time window.
-            chosen = bars[0]
-
-        if chosen is None:
-            return None
-
-        # Cache
-        setattr(self, "_last_settlement_candle_open_ms", candle_open_ms)
-        setattr(self, "_last_settlement_price", chosen.get("close"))
-
-        if price_type == "close" or price_type == "vwap" or price_type == "unknown":
-            # Binance REST kline doesn't provide VWAP per candle in this endpoint.
-            return float(chosen.get("close"))
-
-        return float(chosen.get("close"))
-
     # ── WebSocket Connection ──────────────────────────────────
 
     async def start(self) -> None:
@@ -331,7 +248,7 @@ class BinanceFeed:
                     elif "aggTrade" in stream:
                         self._handle_agg_trade(data)
                     elif "kline" in stream:
-                        await self._handle_kline(stream, data)
+                        await self._handle_kline(data)
 
                 except json.JSONDecodeError:
                     logger.warning("binance_ws_invalid_json")
@@ -378,17 +295,13 @@ class BinanceFeed:
         except (KeyError, ValueError) as e:
             logger.warning("binance_agg_trade_parse_error", error=str(e))
 
-    async def _handle_kline(self, stream: str, data: Dict[str, Any]) -> None:
-        """Process kline (candlestick) data for supported intervals."""
+    async def _handle_kline(self, data: Dict[str, Any]) -> None:
+        """Process kline (candlestick) data."""
         try:
             kline = data.get("k", {})
             is_closed = kline.get("x", False)
 
             if is_closed:
-                interval = "unknown"
-                if "@kline_" in stream:
-                    interval = stream.split("@kline_", 1)[1]
-
                 bar = {
                     "open_time": kline["t"],
                     "open": float(kline["o"]),
@@ -397,33 +310,22 @@ class BinanceFeed:
                     "close": float(kline["c"]),
                     "volume": float(kline["v"]),
                     "close_time": kline["T"],
-                    "interval": interval,
                 }
 
                 if self._validate_bar(bar):
-                    if interval == "15m":
-                        self._ohlcv_buffer.append(bar)
-                        self._last_bar_close_time = datetime.fromtimestamp(
-                            bar["close_time"] / 1000.0, tz=timezone.utc
-                        )
-                    elif interval == "1m":
-                        self._ohlcv_1m_buffer.append(bar)
-                        # Keep 15m bar-close callback semantics unchanged:
-                        # we only trigger _on_bar_close from 15m candles.
-                    else:
-                        # Store nothing for unknown intervals.
-                        pass
+                    self._ohlcv_buffer.append(bar)
+                    self._last_bar_close_time = datetime.fromtimestamp(
+                        bar["close_time"] / 1000.0, tz=timezone.utc
+                    )
                     logger.info(
                         "binance_bar_closed",
                         close=bar["close"],
                         volume=bar["volume"],
-                        buffer_size=len(self._ohlcv_buffer)
-                        if interval == "15m"
-                        else len(self._ohlcv_1m_buffer),
+                        buffer_size=len(self._ohlcv_buffer),
                     )
 
                     # Trigger bar close callback
-                    if self._on_bar_close and interval == "15m":
+                    if self._on_bar_close:
                         await self._on_bar_close(bar)
                 else:
                     logger.warning("binance_bar_rejected", bar=bar)

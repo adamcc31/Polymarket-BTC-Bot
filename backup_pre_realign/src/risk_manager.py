@@ -14,16 +14,12 @@ from __future__ import annotations
 import asyncio
 from typing import List, Optional, Union
 
-try:
-    import structlog  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
-    structlog = None
-import logging
+import structlog
 
 from src.config_manager import ConfigManager
 from src.schemas import ApprovedBet, RejectedBet, SignalResult
 
-logger = structlog.get_logger(__name__) if structlog else logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class RiskManager:
@@ -197,11 +193,10 @@ class RiskManager:
         # ── Decimal odds from CLOB ────────────────────────────
         if signal.signal == "BUY_YES":
             clob_ask = signal.clob_yes_ask
-            # Conservative probability: subtract uncertainty from the event we bet on.
-            p_win = max(0.0, min(1.0, signal.P_model - signal.uncertainty_u))
+            p_win = signal.P_model
         else:  # BUY_NO
             clob_ask = signal.clob_no_ask
-            p_win = max(0.0, min(1.0, (1.0 - signal.P_model) - signal.uncertainty_u))
+            p_win = 1.0 - signal.P_model
 
         # b = decimal odds: profit per unit wagered if win
         # For binary: buy at clob_ask, payout $1 → profit = 1/clob_ask - 1
@@ -230,18 +225,7 @@ class RiskManager:
 
         # ── Final Bet Size ────────────────────────────────────
         raw_bet = capital * half_kelly * kelly_multiplier
-
-        # Time-aware shrink factor: reduce exposure as resolution approaches.
-        ttr_scale = float(self._config.get("risk.ttr_size_scale_minutes", 10.0))
-        time_mult = min(1.0, max(0.25, float(signal.TTR_minutes) / (ttr_scale + 1e-8)))
-
-        # Liquidity proxy: scale down in more aggressive books (higher vig).
-        vig = float(signal.clob_yes_ask + signal.clob_no_ask - 1.0)
-        max_vig = float(self._config.get("risk.max_vig_for_sizing", 0.07))
-        vig_mult = min(1.0, max(0.25, 1.0 - (max(0.0, vig) / (max_vig + 1e-8))))
-
-        bet_size = raw_bet * time_mult * vig_mult
-        bet_size = max(bet_size, min_bet)
+        bet_size = max(raw_bet, min_bet)
         bet_size = min(bet_size, capital * max_bet_frac)
         bet_size = round(bet_size, 2)  # USDC 2-decimal precision
 

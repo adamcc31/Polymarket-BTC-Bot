@@ -15,11 +15,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import numpy as np
-try:
-    import structlog  # type: ignore
-except ModuleNotFoundError:  # pragma: no cover
-    structlog = None
-import logging
+import structlog
 
 from src.binance_feed import BinanceFeed
 from src.config_manager import ConfigManager
@@ -31,7 +27,7 @@ from src.schemas import (
     SignalResult,
 )
 
-logger = structlog.get_logger(__name__) if structlog else logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class DryRunEngine:
@@ -62,9 +58,6 @@ class DryRunEngine:
             "LIQUIDITY_BLOCK": 0,
             "TTR_PHASE": 0,
             "NO_EDGE": 0,
-            "NO_TRADE_ZONE": 0,
-            "BASIS_RISK_BLOCK": 0,
-            "BASIS_RISK_INFLATED": 0,
         }
         self._bars_processed: int = 0
         self._consecutive_losses: int = 0
@@ -109,25 +102,13 @@ class DryRunEngine:
         signal: SignalResult,
         approved_bet: ApprovedBet,
         active_market: ActiveMarket,
-        entry_price_override: Optional[float] = None,
-        bet_size_override: Optional[float] = None,
     ) -> PaperTrade:
         """
         Create paper trade record. Resolution happens asynchronously.
         """
         entry_price = (
-            entry_price_override
-            if entry_price_override is not None
-            else (
-                signal.clob_yes_ask
-                if signal.signal == "BUY_YES"
-                else signal.clob_no_ask
-            )
-        )
-        bet_size = (
-            float(bet_size_override)
-            if bet_size_override is not None
-            else float(approved_bet.bet_size)
+            signal.clob_yes_ask if signal.signal == "BUY_YES"
+            else signal.clob_no_ask
         )
 
         trade = PaperTrade(
@@ -136,7 +117,7 @@ class DryRunEngine:
             market_id=active_market.market_id,
             signal_type=signal.signal,
             entry_price=entry_price,
-            bet_size=bet_size,
+            bet_size=approved_bet.bet_size,
             strike_price=active_market.strike_price,
             T_resolution=active_market.T_resolution,
             TTR_at_entry=signal.TTR_minutes,
