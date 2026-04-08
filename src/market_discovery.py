@@ -316,6 +316,14 @@ class MarketDiscovery:
 
                     parsed = self._parse_market(m)
                     if parsed and parsed.TTR_minutes >= self._min_ttr:
+                        # Ensure CLOB tradability: must have YES/NO token IDs.
+                        if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                            if len(skipped_reasons) < 5:
+                                skipped_reasons.append(
+                                    f"Missing-Token-IDs: '{q[:50]}...'"
+                                )
+                            continue
+
                         # Basis-risk policy: only hard-skip if explicitly configured.
                         non_binance_policy = self._config.get(
                             "settlement.non_binance_policy", "uncertainty_inflate"
@@ -468,14 +476,26 @@ class MarketDiscovery:
 
         if isinstance(tokens, list):
             for token in tokens:
-                outcome = token.get("outcome", "").upper()
-                token_id = token.get("token_id", "")
+                outcome = str(token.get("outcome", "")).upper()
+                token_id = (
+                    token.get("token_id")
+                    or token.get("tokenId")
+                    or token.get("clobTokenId")
+                    or ""
+                )
                 if outcome in ("YES", "NO") and token_id:
                     token_ids[outcome] = token_id
 
         # Fallback: try clobTokenIds field
         if not token_ids.get("YES"):
             clob_ids = market_data.get("clobTokenIds", [])
+            if isinstance(clob_ids, str):
+                # Some responses return stringified JSON list.
+                try:
+                    import json
+                    clob_ids = json.loads(clob_ids)
+                except Exception:
+                    clob_ids = []
             if isinstance(clob_ids, list) and len(clob_ids) >= 2:
                 token_ids["YES"] = clob_ids[0]
                 token_ids["NO"] = clob_ids[1]

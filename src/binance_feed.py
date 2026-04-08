@@ -53,6 +53,29 @@ class BinanceFeed:
         self._config = config
         self._ws_base_url = config.get("binance.ws_base_url", "wss://stream.binance.com:9443/stream")
         self._rest_base_url = config.get("binance.rest_base_url", "https://api.binance.com")
+        self._ws_base_urls = config.get(
+            "binance.ws_base_urls",
+            [
+                self._ws_base_url,
+                "wss://stream.binance.com:443/stream",
+                "wss://stream.binance.us:9443/stream",
+            ],
+        )
+        self._rest_base_urls = config.get(
+            "binance.rest_base_urls",
+            [
+                self._rest_base_url,
+                "https://api1.binance.com",
+                "https://api-gcp.binance.com",
+                "https://api.binance.us",
+            ],
+        )
+        if not isinstance(self._ws_base_urls, list):
+            self._ws_base_urls = [self._ws_base_url]
+        if not isinstance(self._rest_base_urls, list):
+            self._rest_base_urls = [self._rest_base_url]
+        self._ws_url_index = 0
+        self._rest_url_index = 0
         self._buffer_capacity = config.get("binance.buffer_capacity", 500)
         self._buffer_capacity_1m = config.get("binance.buffer_capacity_1m", 3000)
         self._stale_threshold_s = config.get("binance.stale_threshold_s", 30)
@@ -142,35 +165,30 @@ class BinanceFeed:
         Bootstrap OHLCV buffer with historical data from REST API.
         Returns number of bars loaded.
         """
-        url = f"{self._rest_base_url}/api/v3/klines"
         params = {"symbol": "BTCUSDT", "interval": "15m", "limit": limit}
+        try:
+            resp = await self._rest_get("/api/v3/klines", params=params)
+            klines = resp.json()
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                resp = await client.get(url, params=params)
-                resp.raise_for_status()
-                klines = resp.json()
+            for k in klines:
+                bar = self._parse_rest_kline(k)
+                if bar and self._validate_bar(bar):
+                    self._ohlcv_buffer.append(bar)
 
-                for k in klines:
-                    bar = self._parse_rest_kline(k)
-                    if bar and self._validate_bar(bar):
-                        self._ohlcv_buffer.append(bar)
+            logger.info(
+                "binance_bootstrap_complete",
+                bars_loaded=len(self._ohlcv_buffer),
+            )
+            return len(self._ohlcv_buffer)
 
-                logger.info(
-                    "binance_bootstrap_complete",
-                    bars_loaded=len(self._ohlcv_buffer),
-                )
-                return len(self._ohlcv_buffer)
-
-            except httpx.HTTPError as e:
-                logger.error("binance_bootstrap_failed", error=str(e))
-                return 0
+        except httpx.HTTPError as e:
+            logger.error("binance_bootstrap_failed", error=str(e))
+            return 0
 
     async def fetch_rest_klines(
         self, limit: int = 500, start_time: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """Fetch historical klines from REST API (for gap-fill)."""
-        url = f"{self._rest_base_url}/api/v3/klines"
         params: Dict[str, Any] = {
             "symbol": "BTCUSDT",
             "interval": "15m",
@@ -179,15 +197,13 @@ class BinanceFeed:
         if start_time:
             params["startTime"] = start_time
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            klines = resp.json()
-            return [
-                bar
-                for k in klines
-                if (bar := self._parse_rest_kline(k)) and self._validate_bar(bar)
-            ]
+        resp = await self._rest_get("/api/v3/klines", params=params)
+        klines = resp.json()
+        return [
+            bar
+            for k in klines
+            if (bar := self._parse_rest_kline(k)) and self._validate_bar(bar)
+        ]
 
     async def get_1m_settlement_price(
         self,
@@ -216,7 +232,6 @@ class BinanceFeed:
         ):
             return getattr(self, "_last_settlement_price", None)
 
-        url = f"{self._rest_base_url}/api/v3/klines"
         params = {
             "symbol": symbol,
             "interval": "1m",
@@ -224,10 +239,8 @@ class BinanceFeed:
             "limit": 2,
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            klines = resp.json()
+        resp = await self._rest_get("/api/v3/klines", params=params)
+        klines = resp.json()
 
         bars: list[Dict[str, Any]] = []
         for k in klines:
@@ -272,6 +285,7 @@ class BinanceFeed:
                 if not self._running:
                     break
                 self._health.reconnect_count += 1
+                self._ws_url_index = (self._ws_url_index + 1) % max(1, len(self._ws_base_urls))
                 delay = self._compute_backoff_delay()
                 logger.warning(
                     "binance_ws_disconnected",
@@ -293,6 +307,7 @@ class BinanceFeed:
                 logger.error("binance_ws_unexpected_error", error=str(e))
                 if not self._running:
                     break
+                self._ws_url_index = (self._ws_url_index + 1) % max(1, len(self._ws_base_urls))
                 await asyncio.sleep(5.0)
 
     async def stop(self) -> None:
@@ -306,7 +321,8 @@ class BinanceFeed:
     async def _connect_and_listen(self) -> None:
         """Establish WS connection and process messages."""
         streams_param = "/".join(self.STREAMS)
-        url = f"{self._ws_base_url}?streams={streams_param}"
+        ws_base = self._ws_base_urls[self._ws_url_index % len(self._ws_base_urls)]
+        url = f"{ws_base}?streams={streams_param}"
 
         async with websockets.connect(
             url, ping_interval=20, ping_timeout=10, close_timeout=5
@@ -550,3 +566,30 @@ class BinanceFeed:
         """Compute exponential backoff delay."""
         delay = self._initial_delay_s * (self._backoff_multiplier ** self._retry_count)
         return min(delay, self._max_delay_s)
+
+    async def _rest_get(self, path: str, params: Dict[str, Any]) -> httpx.Response:
+        """Try multiple Binance REST bases, rotate on failures like HTTP 451."""
+        last_error: Exception | None = None
+        n = len(self._rest_base_urls)
+        for i in range(n):
+            idx = (self._rest_url_index + i) % n
+            base = self._rest_base_urls[idx]
+            url = f"{base}{path}"
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(url, params=params)
+                    resp.raise_for_status()
+                self._rest_url_index = idx
+                return resp
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status = e.response.status_code if e.response else None
+                logger.warning("binance_rest_failed", base=base, status=status)
+                continue
+            except Exception as e:
+                last_error = e
+                logger.warning("binance_rest_failed", base=base, error=str(e))
+                continue
+        if last_error:
+            raise last_error
+        raise RuntimeError("All Binance REST endpoints failed")
