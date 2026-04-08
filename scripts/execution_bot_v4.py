@@ -64,7 +64,7 @@ class SlowSkewBotV4:
         self.last_minute_ts = None
         self.last_heartbeat = 0
         self.last_tg_heartbeat = 0
-        self.last_telemetry_export = time.time() # Tracker for CSV push
+        self.last_telemetry_export = time.time()
         self.is_redundant_mode = False
         self.pyth_fail_count = 0
         
@@ -95,27 +95,32 @@ class SlowSkewBotV4:
             return False
 
     def bootstrap_discovery(self):
+        # [REVERTED TO v28 STABLE LOGIC]
         manual_id = os.environ.get("TARGET_TOKEN_ID")
         if manual_id:
+            logger.info(f"🛡️ MANUAL OVERRIDE: Using Token ID {manual_id}")
             self.yes_token_id = manual_id
             return True
+
         logger.info("Searching for Active Bitcoin target...")
         try:
-            r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=10)
+            r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=15)
             markets = r.json()
             for m in markets:
-                if "Bitcoin" in m.get('question', '') and m.get('clobTokenIds'):
+                # v28 question pattern check
+                if ("Bitcoin" in m.get('question', '') or "BTC" in m.get('question', '')) and m.get('clobTokenIds'):
                     ids = m['clobTokenIds']
                     if isinstance(ids, str):
                         try: ids = json.loads(ids)
-                        except: ids = [ids.replace('[','').replace(']','').replace('"','')]
+                        except: ids = [ids.replace('[','').replace(']','').replace('"','').replace(',','')]
                     if not ids: continue
                     tid = ids[0]
                     try:
+                        logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid}")
                         self.clob_client.get_order_book(tid)
                         self.yes_token_id = tid
                         self.target_market_name = m.get('question', 'Unknown Bitcoin Market')
-                        logger.info(f"🎯 LIQUID TARGET: {self.target_market_name}")
+                        logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_name}")
                         return True
                     except: continue
             return False
@@ -135,27 +140,23 @@ class SlowSkewBotV4:
             except: pass
 
     async def push_telemetry_file(self, session):
-        """Pushes the telemetry CSV to Telegram for remote calibration."""
+        """[MODUL TELEMETRY v29]"""
         tg_token = os.environ.get("TELEGRAM_TOKEN")
         tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
         if not (tg_token and tg_chat) or not os.path.exists(self.telemetry_file):
             return
-
         try:
             logger.info("📤 Pushing telemetry CSV to Telegram...")
             url = f"https://api.telegram.org/bot{tg_token}/sendDocument"
             data = aiohttp.FormData()
             data.add_field('chat_id', tg_chat)
             data.add_field('caption', f"📊 Telemetry Export: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            
             with open(self.telemetry_file, 'rb') as f:
                 data.add_field('document', f, filename=os.path.basename(self.telemetry_file))
                 async with session.post(url, data=data, timeout=30) as resp:
                     if resp.status == 200:
                         logger.info("✅ Telemetry CSV sent successfully.")
                         return True
-                    else:
-                        logger.error(f"❌ Failed to send CSV: {resp.status}")
         except Exception as e:
             logger.error(f"Telemetry push failed: {e}")
         return False
@@ -170,6 +171,7 @@ class SlowSkewBotV4:
         except Exception: return None
 
     async def get_pyth_price(self, session):
+        # [REVERTED TO v28 STABLE LOGIC]
         params = {"ids[]": [BTC_FEED_ID]}
         try:
             async with session.get(PYTH_HERMES_BASE, params=params, timeout=10) as resp:
@@ -187,16 +189,15 @@ class SlowSkewBotV4:
                 else:
                     logger.warning(f"Pyth Primary failed ({resp.status}). Activating Binance Fallback...")
         except Exception: pass
-        
         self.pyth_fail_count += 1
         self.is_redundant_mode = True
         return await self.get_binance_price(session)
 
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
-            logger.info("🟢 CLOUD BOT ACTIVE (v29: Remote Telemetry).")
-            await self.send_alert(session, "[SYSTEM ONLINE]", 
-                                 f"CSV Upload: Active (Every 5h)\nTarget: `{self.target_market_name}`")
+            logger.info("🟢 CLOUD BOT ACTIVE (v30: Stabilized + Telemetry).")
+            await self.send_alert(session, "[SYSTEM RESTORED]", 
+                                 f"Bot returned to v28 Discovery logic.\nTarget: `{self.target_market_name}`")
             
             while True:
                 try:
@@ -208,18 +209,16 @@ class SlowSkewBotV4:
                     now = datetime.now()
                     current_minute = now.replace(second=0, microsecond=0)
                     
-                    # 💓 CONSOLE HEARTBEAT
                     if self.last_heartbeat == 0 or (time.time() - self.last_heartbeat > 300):
                         source = "Binance (Backup)" if self.is_redundant_mode else "Pyth (Primary)"
                         logger.info(f"💓 HEARTBEAT | Source: {source} | BTC: ${price:,.2f}")
                         self.last_heartbeat = time.time()
                     
-                    # 📱 TELEGRAM HEARTBEAT
                     if time.time() - self.last_tg_heartbeat > 14400:
                         await self.send_alert(session, "[HEARTBEAT]", f"BTC Stable: ${price:,.2f}")
                         self.last_tg_heartbeat = time.time()
 
-                    # 📤 TELEMETRY CSV PUSH (Every 5 Hours = 18000s)
+                    # Telemetry push (5h)
                     if time.time() - self.last_telemetry_export > 18000:
                         if await self.push_telemetry_file(session):
                             self.last_telemetry_export = time.time()
@@ -235,7 +234,6 @@ class SlowSkewBotV4:
                         logger.info(f"Baseline set: ${price:,.2f}")
                     
                     self.last_minute_ts = current_minute
-                    
                     backoff_delay = min(self.pyth_fail_count * 15, 60) if self.is_redundant_mode else 0
                     await asyncio.sleep(15 + backoff_delay)
                 except Exception as e:
