@@ -64,6 +64,7 @@ class SlowSkewBotV4:
         self.last_minute_ts = None
         self.last_heartbeat = 0
         self.last_tg_heartbeat = 0
+        self.last_csv_sent = 0
         self.is_redundant_mode = False
         self.pyth_fail_count = 0
         
@@ -190,15 +191,32 @@ class SlowSkewBotV4:
         return False
 
     async def send_alert(self, session, title, message):
+        webhook_url = os.environ.get("NOTIF_WEBHOOK_URL")
+        if not webhook_url: return
+        try:
+            payload = {"content": f"🔥 **{title}**\n{message}"}
+            async with session.post(webhook_url, json=payload, timeout=5) as resp: pass
+        except: pass
+
+    async def send_document(self, session, file_path, caption=""):
         tg_token = os.environ.get("TELEGRAM_TOKEN")
         tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
-        if tg_token and tg_chat:
+        if tg_token and tg_chat and os.path.exists(file_path):
             try:
-                url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
-                payload = {"chat_id": tg_chat, "text": f"🔥 {title}\n\n{message}"}
-                async with session.post(url, json=payload, timeout=5) as resp:
-                    if resp.status == 200: return
-            except: pass
+                url = f"https://api.telegram.org/bot{tg_token}/sendDocument"
+                with open(file_path, 'rb') as f:
+                    data = aiohttp.FormData()
+                    data.add_field('chat_id', str(tg_chat))
+                    data.add_field('caption', caption)
+                    data.add_field('document', f, filename=os.path.basename(file_path))
+                    
+                    async with session.post(url, data=data, timeout=15) as resp:
+                        if resp.status == 200:
+                            logger.info(f"Telegram Doc Sent: {file_path}")
+                        else:
+                            logger.warning(f"Failed to send Doc. Status: {resp.status}")
+            except Exception as e:
+                logger.error(f"Failed to send Telegram Doc: {e}")
 
     async def get_binance_price(self, session):
         try:
@@ -243,6 +261,11 @@ class SlowSkewBotV4:
             await self.send_alert(session, "[SYSTEM ONLINE]", 
                                  f"Verified Feed ID: {BTC_FEED_ID[:10]}...\nTarget: `{self.target_market_name}`")
             
+            # Boot-up file send verification
+            if os.path.exists(self.telemetry_file):
+                await self.send_document(session, self.telemetry_file, caption="🚀 Boot-up Telemetry Audit")
+            self.last_csv_sent = time.time()
+            
             while True:
                 try:
                     price = await self.get_pyth_price(session)
@@ -261,6 +284,12 @@ class SlowSkewBotV4:
                     if time.time() - self.last_tg_heartbeat > 14400:
                         await self.send_alert(session, "[HEARTBEAT]", f"BTC Stable: ${price:,.2f}")
                         self.last_tg_heartbeat = time.time()
+
+                    # 5 Hours = 18000 seconds
+                    if time.time() - self.last_csv_sent > 18000:
+                        if os.path.exists(self.telemetry_file):
+                            await self.send_document(session, self.telemetry_file, caption="📊 5-Hour Telemetry Audit")
+                        self.last_csv_sent = time.time()
 
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
                         momentum = price - self.last_minute_price
