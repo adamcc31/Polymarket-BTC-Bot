@@ -191,6 +191,16 @@ class SlowSkewBotV4:
         return False
 
     async def send_alert(self, session, title, message):
+        tg_token = os.environ.get("TELEGRAM_TOKEN")
+        tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
+        if tg_token and tg_chat:
+            try:
+                url = f"https://api.telegram.org/bot{tg_token}/sendMessage"
+                payload = {"chat_id": tg_chat, "text": f"🔥 {title}\n\n{message}"}
+                async with session.post(url, json=payload, timeout=5) as resp:
+                    if resp.status == 200: return
+            except: pass
+
         webhook_url = os.environ.get("NOTIF_WEBHOOK_URL")
         if not webhook_url: return
         try:
