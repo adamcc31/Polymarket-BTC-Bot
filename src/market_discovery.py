@@ -268,64 +268,68 @@ class MarketDiscovery:
 
     async def _query_candidates(self) -> list[dict]:
         """
-        Query Gamma API via /events endpoint for active labeled markets.
-        Uses tag_slug (default: 'bitcoin') to focus discovery on relevant assets.
+        Query Gamma API via /markets endpoint for active price-action targets.
+        Uses a high limit (200) to find daily markets even if buried in volume.
         """
-        tag_slug = self._config.get("market_discovery.tag_slug", "bitcoin")
         min_volume = self._config.get("market_discovery.min_volume_24hr", 1000.0)
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
-                    f"{self.GAMMA_API_BASE}/events",
+                    f"{self.GAMMA_API_BASE}/markets",
                     params={
                         "active": "true",
                         "closed": "false",
-                        "archived": "false",
-                        "tag_slug": tag_slug,
-                        "limit": 20
+                        "order": "volume24hr",
+                        "ascending": "false",
+                        "limit": 200
                     },
                 )
                 resp.raise_for_status()
-                events = resp.json()
+                markets = resp.json()
 
-                if not isinstance(events, list):
-                    events = events.get("data", []) if isinstance(events, dict) else []
+                if not isinstance(markets, list):
+                    markets = markets.get("data", []) if isinstance(markets, dict) else []
 
                 candidates = []
-                for event in events:
-                    markets = event.get("markets", [])
-                    for m in markets:
-                        # Ensure market is active and has an orderbook
-                        if not m.get("active") or m.get("closed") or not m.get("enableOrderBook"):
-                            continue
-                            
-                        # Pattern check to ensure it's still a price-action market
-                        if not self._is_btc_up_down_market(m):
-                            continue
-                            
-                        parsed = self._parse_market(m)
-                        if parsed and parsed.TTR_minutes >= self._min_ttr:
-                            # Use 24hr volume as liquidity proxy
-                            volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
-                            
-                            if volume >= min_volume:
-                                candidates.append({"market": parsed, "volume": volume})
+                skipped_reasons = [] # Log top 5 skipped for transparency
 
-                if not candidates:
-                    logger.info(
-                        "no_valid_candidates_found", 
-                        tag_slug=tag_slug, 
-                        min_volume=min_volume
-                    )
+                for m in markets:
+                    q = m.get("question", "")
+                    
+                    # 1. Basic Technical Filter
+                    if not m.get("active") or m.get("closed") or not m.get("enableOrderBook"):
+                        continue
+                            
+                    # 2. Design Pattern Check (Strict Above/Up/Down)
+                    if not self._is_btc_up_down_market(m):
+                        if len(skipped_reasons) < 5 and ("bitcoin" in q.lower() or "btc" in q.lower()):
+                            skipped_reasons.append(f"PA-Mismatch: '{q[:50]}...'")
+                        continue
+                            
+                    # 3. Volume Check
+                    volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
+                    if volume < min_volume:
+                        if len(skipped_reasons) < 5:
+                            skipped_reasons.append(f"Low-Volume: '${volume:,.0f}' for '{q[:50]}...'")
+                        continue
+
+                    parsed = self._parse_market(m)
+                    if parsed and parsed.TTR_minutes >= self._min_ttr:
+                        candidates.append({"market": parsed, "volume": volume})
+
+                if not candidates and skipped_reasons:
+                    logger.info("discovery_skipped_candidates", 
+                                top_reasons=skipped_reasons,
+                                total_markets_scanned=len(markets))
 
                 return candidates
 
         except httpx.HTTPError as e:
-            logger.error("gamma_api_error_events", error=str(e))
+            logger.error("gamma_api_error_markets", error=str(e))
             return []
         except Exception as e:
-            logger.error("market_discovery_parse_error_events", error=str(e))
+            logger.error("market_discovery_parse_error_markets", error=str(e))
             return []
 
     def _is_btc_up_down_market(self, market_data: dict) -> bool:

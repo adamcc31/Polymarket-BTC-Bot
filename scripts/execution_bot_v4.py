@@ -100,43 +100,57 @@ class SlowSkewBotV4:
             logger.info(f"Using manual TARGET_TOKEN_ID: {manual_id}")
             return True
 
-        tag_slug = os.environ.get("MARKET_TAG_SLUG", "bitcoin")
         min_volume = float(os.environ.get("MIN_VOLUME_24HR", 1000.0))
 
         for attempt in range(1, max_attempts + 1):
             logger.info(f"Searching for Active Bitcoin target (Attempt {attempt}/{max_attempts})...")
             try:
-                # Query /events with tag_slug for better grouping/reliability
+                # Query /markets with high limit to find buried daily price-action
                 r = requests.get(
-                    'https://gamma-api.polymarket.com/events', 
+                    'https://gamma-api.polymarket.com/markets', 
                     params={
                         'active': 'true',
                         'closed': 'false',
-                        'archived': 'false',
-                        'tag_slug': tag_slug,
-                        'limit': 20
+                        'order': 'volume24hr',
+                        'ascending': 'false',
+                        'limit': 200
                     },
                     timeout=10
                 )
                 r.raise_for_status()
-                events = r.json()
+                markets = r.json()
                 
                 candidates = []
-                for event in events:
-                    for m in event.get('markets', []):
-                        # Ensure market is active and has an orderbook
-                        if not m.get('active') or m.get('closed') or not m.get('enableOrderBook'):
-                            continue
-                        
-                        # Basic pattern check for Bitcoin price-action
-                        question = m.get('question', '').lower()
-                        if not any(p in question for p in ['bitcoin', 'btc']) or not any(p in question for p in ['above', 'up', 'down']):
-                            continue
+                skipped_reasons = []
+
+                for m in markets:
+                    q = m.get('question', '')
+                    
+                    # 1. Technical filters
+                    if not m.get('active') or m.get('closed') or not m.get('enableOrderBook'):
+                        continue
+                    
+                    # 2. Strict Price-Action Pattern (Above/Up/Down/Below)
+                    q_low = q.lower()
+                    is_btc = "bitcoin" in q_low or "btc" in q_low
+                    is_pa = any(p in q_low for p in ['above', 'up', 'down', 'below'])
+                    
+                    if not (is_btc and is_pa):
+                        if len(skipped_reasons) < 5 and is_btc:
+                            skipped_reasons.append(f"Non-PA: '{q[:40]}...'")
+                        continue
                             
-                        # Volume threshold (1,000 USD default)
-                        vol = float(m.get('volume24hr') or m.get('volume') or 0.0)
-                        if vol >= min_volume:
-                            candidates.append({'market': m, 'volume': vol})
+                    # 3. Volume Check
+                    vol = float(m.get('volume24hr') or m.get('volume') or 0.0)
+                    if vol < min_volume:
+                        if len(skipped_reasons) < 5:
+                            skipped_reasons.append(f"Low-Vol: '${vol:,.0f}' for '{q[:40]}...'")
+                        continue
+                        
+                    candidates.append({'market': m, 'volume': vol})
+                
+                if not candidates and skipped_reasons:
+                    logger.warning(f"No candidates passed filters. Top rejections: {skipped_reasons}")
                 
                 # Sort by volume descending
                 candidates.sort(key=lambda x: x['volume'], reverse=True)
@@ -163,15 +177,14 @@ class SlowSkewBotV4:
                         continue
                 
                 if attempt < max_attempts:
-                    logger.warning(f"No valid candidates found on attempt {attempt}. Retrying in {delay_s}s...")
+                    logger.warning(f"No valid targets found on attempt {attempt}. Retrying in {delay_s}s...")
                     time.sleep(delay_s)
                 else:
-                    logger.error("All discovery attempts exhausted. No active Bitcoin targets found with enough volume.")
+                    logger.error("All discovery attempts exhausted.")
                     
             except Exception as e:
                 logger.error(f"Discovery attempt {attempt} error: {e}")
                 if attempt < max_attempts:
-                    logger.info(f"Retrying in {delay_s}s...")
                     time.sleep(delay_s)
         
         return False
