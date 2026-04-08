@@ -119,6 +119,15 @@ class TradingBot:
         self._exporter: Exporter | None = None
         self._telegram = TelegramNotifier(self._config)
 
+        # Dry run / live engine
+        initial_capital = 100.0 if self._requested_mode == "dry-run" else 50.0
+        self._dry_run = DryRunEngine(self._config, initial_capital=initial_capital)
+        self._exporter = Exporter(self._dry_run.session_id)
+
+        # Dashboard state
+        self._latest_signal = None
+        self._latest_metrics = None
+
     async def _send_telegram(self, title: str, message: str) -> None:
         """Telegram send helper (never raises)."""
         try:
@@ -144,15 +153,6 @@ class TradingBot:
             f"session_id={self._dry_run.session_id}",
         )
         await self.stop()
-
-        # Dry run / live engine
-        initial_capital = 100.0 if self._requested_mode == "dry-run" else 50.0
-        self._dry_run = DryRunEngine(self._config, initial_capital=initial_capital)
-        self._exporter = Exporter(self._dry_run.session_id)
-
-        # Dashboard state
-        self._latest_signal = None
-        self._latest_metrics = None
 
     async def start(self) -> None:
         """Start all subsystems and enter main loop."""
