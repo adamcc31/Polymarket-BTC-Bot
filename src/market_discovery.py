@@ -52,6 +52,11 @@ class MarketDiscovery:
         r"btc.*up.*or.*down",
         r"bitcoin.*above.*\$",
         r"btc.*above.*\$",
+        r"bitcoin.*reach.*\$",
+        r"btc.*reach.*\$",
+        r"bitcoin.*dip.*\$",
+        r"btc.*dip.*\$",
+        r"what\s+price\s+will\s+bitcoin\s+hit",
     ]
 
     # Strike price extraction patterns
@@ -59,6 +64,9 @@ class MarketDiscovery:
         r"\$([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)",  # $66,500.00 or $66500
         r"above\s+\$?([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)",
         r"below\s+\$?([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)",
+        r"reach\s+\$?([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)",
+        r"dip(?:\s+to)?\s+\$?([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)",
+        r"up\s+or\s+down\s+from\s+\$?([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)",
     ]
 
     def __init__(self, config: ConfigManager) -> None:
@@ -371,21 +379,38 @@ class MarketDiscovery:
         CRITICAL: Strike price extracted from question text / metadata.
         """
         try:
-            market_id = market_data.get("condition_id") or market_data.get("id", "")
+            market_id = (
+                market_data.get("conditionId")
+                or market_data.get("condition_id")
+                or market_data.get("id", "")
+            )
             question = market_data.get("question", "")
 
             # Extract strike price from question text
             strike_price = self._extract_strike_price(question)
             if strike_price is None:
+                # Multi-market events often store leg-like text here.
+                group_item = market_data.get("groupItemTitle", "")
+                strike_price = self._extract_strike_price(group_item)
+            if strike_price is None:
                 # Try from description
                 desc = market_data.get("description", "")
                 strike_price = self._extract_strike_price(desc)
             if strike_price is None:
-                logger.warning(
-                    "strike_price_not_found",
-                    market_id=market_id,
-                    question=question,
-                )
+                question_l = question.lower()
+                # Keep logs clean for known non-strike "directional" products.
+                if "up or down" in question_l and "from $" not in question_l:
+                    logger.info(
+                        "unsupported_market_type_no_strike",
+                        market_id=market_id,
+                        question=question,
+                    )
+                else:
+                    logger.warning(
+                        "strike_price_not_found",
+                        market_id=market_id,
+                        question=question,
+                    )
                 return None
 
             # Parse timestamps
@@ -522,6 +547,8 @@ class MarketDiscovery:
             market_data.get("description", "")
             + " "
             + market_data.get("resolution_source", "")
+            + " "
+            + market_data.get("resolutionSource", "")
             + " "
             + str(market_data.get("uma_resolution_rules", ""))
         ).lower()
