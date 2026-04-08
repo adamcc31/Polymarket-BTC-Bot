@@ -268,44 +268,64 @@ class MarketDiscovery:
 
     async def _query_candidates(self) -> list[dict]:
         """
-        Query Gamma API for all active Bitcoin Up/Down markets.
-
-        Returns a list of dicts: [{"market": ActiveMarket, "volume": float}, ...]
-        filtered to markets with TTR >= min_ttr_to_discover.
-        Volume is sourced from Gamma API (`volume` field) and used as a
-        liquidity proxy, avoiding the cost of extra CLOB orderbook calls.
+        Query Gamma API via /events endpoint for active labeled markets.
+        Uses tag_slug (default: 'bitcoin') to focus discovery on relevant assets.
         """
+        tag_slug = self._config.get("market_discovery.tag_slug", "bitcoin")
+        min_volume = self._config.get("market_discovery.min_volume_24hr", 1000.0)
+
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
-                    f"{self.GAMMA_API_BASE}/markets",
-                    params={"closed": "false", "limit": 50},
+                    f"{self.GAMMA_API_BASE}/events",
+                    params={
+                        "active": "true",
+                        "closed": "false",
+                        "archived": "false",
+                        "tag_slug": tag_slug,
+                        "limit": 20
+                    },
                 )
                 resp.raise_for_status()
-                markets = resp.json()
+                events = resp.json()
 
-                if not isinstance(markets, list):
-                    markets = markets.get("data", []) if isinstance(markets, dict) else []
+                if not isinstance(events, list):
+                    events = events.get("data", []) if isinstance(events, dict) else []
 
                 candidates = []
-                for m in markets:
-                    if not self._is_btc_up_down_market(m):
-                        continue
-                    parsed = self._parse_market(m)
-                    if parsed and parsed.TTR_minutes >= self._min_ttr:
-                        volume = float(m.get("volume", 0.0) or 0.0)
-                        candidates.append({"market": parsed, "volume": volume})
+                for event in events:
+                    markets = event.get("markets", [])
+                    for m in markets:
+                        # Ensure market is active and has an orderbook
+                        if not m.get("active") or m.get("closed") or not m.get("enableOrderBook"):
+                            continue
+                            
+                        # Pattern check to ensure it's still a price-action market
+                        if not self._is_btc_up_down_market(m):
+                            continue
+                            
+                        parsed = self._parse_market(m)
+                        if parsed and parsed.TTR_minutes >= self._min_ttr:
+                            # Use 24hr volume as liquidity proxy
+                            volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
+                            
+                            if volume >= min_volume:
+                                candidates.append({"market": parsed, "volume": volume})
 
                 if not candidates:
-                    logger.info("no_valid_candidates_found")
+                    logger.info(
+                        "no_valid_candidates_found", 
+                        tag_slug=tag_slug, 
+                        min_volume=min_volume
+                    )
 
                 return candidates
 
         except httpx.HTTPError as e:
-            logger.error("gamma_api_error", error=str(e))
+            logger.error("gamma_api_error_events", error=str(e))
             return []
         except Exception as e:
-            logger.error("market_discovery_parse_error", error=str(e))
+            logger.error("market_discovery_parse_error_events", error=str(e))
             return []
 
     def _is_btc_up_down_market(self, market_data: dict) -> bool:

@@ -93,34 +93,88 @@ class SlowSkewBotV4:
             logger.error(f"CLOB Init Failed: {traceback.format_exc()}")
             return False
 
-    def bootstrap_discovery(self):
+    def bootstrap_discovery(self, max_attempts=5, delay_s=15):
         manual_id = os.environ.get("TARGET_TOKEN_ID")
         if manual_id:
             self.yes_token_id = manual_id
+            logger.info(f"Using manual TARGET_TOKEN_ID: {manual_id}")
             return True
-        logger.info("Searching for Active Bitcoin target...")
-        try:
-            r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=10)
-            markets = r.json()
-            for m in markets:
-                if "Bitcoin" in m.get('question', '') and m.get('clobTokenIds'):
-                    ids = m['clobTokenIds']
+
+        tag_slug = os.environ.get("MARKET_TAG_SLUG", "bitcoin")
+        min_volume = float(os.environ.get("MIN_VOLUME_24HR", 1000.0))
+
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"Searching for Active Bitcoin target (Attempt {attempt}/{max_attempts})...")
+            try:
+                # Query /events with tag_slug for better grouping/reliability
+                r = requests.get(
+                    'https://gamma-api.polymarket.com/events', 
+                    params={
+                        'active': 'true',
+                        'closed': 'false',
+                        'archived': 'false',
+                        'tag_slug': tag_slug,
+                        'limit': 20
+                    },
+                    timeout=10
+                )
+                r.raise_for_status()
+                events = r.json()
+                
+                candidates = []
+                for event in events:
+                    for m in event.get('markets', []):
+                        # Ensure market is active and has an orderbook
+                        if not m.get('active') or m.get('closed') or not m.get('enableOrderBook'):
+                            continue
+                        
+                        # Basic pattern check for Bitcoin price-action
+                        question = m.get('question', '').lower()
+                        if not any(p in question for p in ['bitcoin', 'btc']) or not any(p in question for p in ['above', 'up', 'down']):
+                            continue
+                            
+                        # Volume threshold (1,000 USD default)
+                        vol = float(m.get('volume24hr') or m.get('volume') or 0.0)
+                        if vol >= min_volume:
+                            candidates.append({'market': m, 'volume': vol})
+                
+                # Sort by volume descending
+                candidates.sort(key=lambda x: x['volume'], reverse=True)
+                
+                for cand in candidates:
+                    m = cand['market']
+                    ids = m.get('clobTokenIds')
                     if isinstance(ids, str):
                         try: ids = json.loads(ids)
                         except: ids = [ids.replace('[','').replace(']','').replace('"','')]
+                    
                     if not ids: continue
                     tid = ids[0]
+                    
                     try:
+                        # Validate token with a quick orderbook pull
                         self.clob_client.get_order_book(tid)
                         self.yes_token_id = tid
                         self.target_market_name = m.get('question', 'Unknown Bitcoin Market')
-                        logger.info(f"🎯 LIQUID TARGET: {self.target_market_name}")
+                        logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_name} (Vol: ${cand['volume']:,.2f})")
                         return True
-                    except: continue
-            return False
-        except Exception as e:
-            logger.error(f"Discovery error: {e}")
-            return False
+                    except Exception as e:
+                        logger.debug(f"Token {tid} invalid: {e}")
+                        continue
+                
+                if attempt < max_attempts:
+                    logger.warning(f"No valid candidates found on attempt {attempt}. Retrying in {delay_s}s...")
+                    time.sleep(delay_s)
+                else:
+                    logger.error("All discovery attempts exhausted. No active Bitcoin targets found with enough volume.")
+                    
+            except Exception as e:
+                logger.error(f"Discovery attempt {attempt} error: {e}")
+                if attempt < max_attempts:
+                    logger.info(f"Retrying in {delay_s}s...")
+                    time.sleep(delay_s)
+        
+        return False
 
     async def send_alert(self, session, title, message):
         tg_token = os.environ.get("TELEGRAM_TOKEN")
