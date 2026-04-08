@@ -185,22 +185,101 @@ class MarketDiscovery:
             )
         await asyncio.sleep(self._waiting_poll)
 
+    def force_rediscover(self) -> None:
+        """
+        Force immediate reset to SEARCHING state.
+        Called by main.py when CLOBFeed circuit breaker trips (consecutive 404s).
+        Safe to call from any state.
+        """
+        logger.warning(
+            "force_rediscover_triggered",
+            previous_state=self._state.value,
+            previous_market=self._active_market.market_id if self._active_market else None,
+        )
+        self._active_market = None
+        self._state = DiscoveryState.SEARCHING
+
+    async def check_and_rotate(self) -> bool:
+        """
+        Hybrid rotation check — called on every 15-minute bar close.
+
+        Rotation criteria (two-stage):
+          1. TTR gate: candidate.TTR > current.TTR + rotation_ttr_buffer_minutes
+             (prevents excessive switching between markets with similar lifetimes)
+          2. Liquidity tiebreaker: among qualifying candidates, prefer highest
+             Gamma volume (avoids switching to a longer-lived but illiquid market)
+
+        Returns True if rotation occurred, False otherwise.
+        By being called at bar close (not on an independent timer), this ensures
+        market switches never interrupt a Z-score computation mid-window.
+        """
+        if not self._active_market:
+            return False
+
+        rotation_buffer = self._config.get(
+            "market_discovery.rotation_ttr_buffer_minutes", 5.0
+        )
+        current_ttr = self._active_market.TTR_minutes
+
+        candidates = await self._query_candidates()
+        if not candidates:
+            return False
+
+        # Stage 1 — TTR gate: must have meaningfully more time than current market
+        better = [
+            c for c in candidates
+            if c["market"].TTR_minutes > current_ttr + rotation_buffer
+            and c["market"].market_id != self._active_market.market_id
+        ]
+
+        if not better:
+            return False
+
+        # Stage 2 — liquidity tiebreaker: highest Gamma volume wins
+        best = max(better, key=lambda c: c["volume"])
+        new_market = best["market"]
+
+        logger.info(
+            "market_rotated",
+            old_market_id=self._active_market.market_id,
+            old_ttr_minutes=round(current_ttr, 2),
+            new_market_id=new_market.market_id,
+            new_ttr_minutes=round(new_market.TTR_minutes, 2),
+            new_volume_usd=round(best["volume"], 2),
+            ttr_gain_minutes=round(new_market.TTR_minutes - current_ttr, 2),
+        )
+
+        self._active_market = new_market
+        return True
+
     # ── Market Discovery Logic ────────────────────────────────
 
     async def _find_active_market(self) -> Optional[ActiveMarket]:
         """
-        Query Gamma API for active Bitcoin Up/Down markets.
-        Parse strike price from metadata.
+        Query Gamma API and return the single best candidate.
+        Thin wrapper around _query_candidates for use by the state machine.
+        """
+        candidates = await self._query_candidates()
+        if not candidates:
+            return None
+        # Pick highest volume among those with sufficient TTR (already filtered)
+        best = max(candidates, key=lambda c: c["volume"])
+        return best["market"]
+
+    async def _query_candidates(self) -> list[dict]:
+        """
+        Query Gamma API for all active Bitcoin Up/Down markets.
+
+        Returns a list of dicts: [{"market": ActiveMarket, "volume": float}, ...]
+        filtered to markets with TTR >= min_ttr_to_discover.
+        Volume is sourced from Gamma API (`volume` field) and used as a
+        liquidity proxy, avoiding the cost of extra CLOB orderbook calls.
         """
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                # Search for Bitcoin up/down markets
                 resp = await client.get(
                     f"{self.GAMMA_API_BASE}/markets",
-                    params={
-                        "closed": "false",
-                        "limit": 50,
-                    },
+                    params={"closed": "false", "limit": 50},
                 )
                 resp.raise_for_status()
                 markets = resp.json()
@@ -208,37 +287,26 @@ class MarketDiscovery:
                 if not isinstance(markets, list):
                     markets = markets.get("data", []) if isinstance(markets, dict) else []
 
-                # Filter for Bitcoin Up/Down markets
                 candidates = []
                 for m in markets:
-                    if self._is_btc_up_down_market(m):
-                        parsed = self._parse_market(m)
-                        if parsed:
-                            candidates.append(parsed)
+                    if not self._is_btc_up_down_market(m):
+                        continue
+                    parsed = self._parse_market(m)
+                    if parsed and parsed.TTR_minutes >= self._min_ttr:
+                        volume = float(m.get("volume", 0.0) or 0.0)
+                        candidates.append({"market": parsed, "volume": volume})
 
                 if not candidates:
-                    return None
+                    logger.info("no_valid_candidates_found")
 
-                # Pick best candidate: highest TTR within valid range
-                valid = [c for c in candidates if c.TTR_minutes >= self._min_ttr]
-                if not valid:
-                    logger.info(
-                        "all_markets_late",
-                        candidate_count=len(candidates),
-                        ttrs=[round(c.TTR_minutes, 1) for c in candidates],
-                    )
-                    return None
-
-                # Pick the one with most time remaining
-                best = max(valid, key=lambda m: m.TTR_minutes)
-                return best
+                return candidates
 
         except httpx.HTTPError as e:
             logger.error("gamma_api_error", error=str(e))
-            return None
+            return []
         except Exception as e:
             logger.error("market_discovery_parse_error", error=str(e))
-            return None
+            return []
 
     def _is_btc_up_down_market(self, market_data: dict) -> bool:
         """Check if market matches Bitcoin Up/Down patterns."""

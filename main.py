@@ -189,6 +189,20 @@ class TradingBot:
         market = self._discovery.active_market
         await self._discovery.refresh_ttr()
 
+        # ── Bar-close rotation check ──────────────────────────
+        # Aligned here (not on an independent timer) so market switches never
+        # interrupt a Z-score computation mid-window.
+        rotated = await self._discovery.check_and_rotate()
+        if rotated:
+            # Discard stale CLOB cache — next poll will fetch fresh data
+            self._clob._cached_state = None
+            market = self._discovery.active_market
+            logger.info(
+                "bar_close_rotation_applied",
+                new_market_id=market.market_id if market else None,
+            )
+            return  # Skip this bar's signal; let next bar compute on new market
+
         # Check data staleness
         if self._binance.is_stale:
             logger.warning("binance_data_stale_skipping_signal")
@@ -281,7 +295,14 @@ class TradingBot:
     # ── CLOB Polling Loop ─────────────────────────────────────
 
     async def _run_clob_loop(self) -> None:
-        """Poll CLOB data when market is active."""
+        """
+        Poll CLOB data when market is active.
+
+        Circuit breaker: if CLOBFeed accumulates max_consecutive_404 errors,
+        the market has almost certainly expired. We call force_rediscover() to
+        immediately restart the discovery state machine, then reset the breaker
+        so it is ready for the next market cycle.
+        """
         while self._running:
             if self._discovery.is_market_active:
                 market = self._discovery.active_market
@@ -292,6 +313,15 @@ class TradingBot:
                         self._clob._last_fetch_time = __import__("time").time()
                 except Exception as e:
                     logger.error("clob_loop_error", error=str(e))
+
+                # ── Circuit breaker check ─────────────────────
+                if self._clob.circuit_breaker_tripped:
+                    logger.warning(
+                        "clob_circuit_breaker_triggering_rediscover",
+                        market_id=market.market_id if market else None,
+                    )
+                    self._discovery.force_rediscover()
+                    self._clob.reset_circuit_breaker()
 
             poll_interval = self._config.get("clob.poll_interval_seconds", 5)
             await asyncio.sleep(poll_interval)

@@ -41,6 +41,11 @@ class CLOBFeed:
         self._max_retries = 3
         self._backoff_delays = [1, 2, 4]
 
+        # Circuit breaker
+        self._max_consecutive_404 = config.get("clob.max_consecutive_404", 3)
+        self._consecutive_404_count: int = 0
+        self._circuit_breaker_tripped: bool = False
+
         # State
         self._cached_state: Optional[CLOBState] = None
         self._last_fetch_time: float = 0.0
@@ -59,6 +64,17 @@ class CLOBFeed:
     @property
     def stale_event_count(self) -> int:
         return self._stale_event_count
+
+    @property
+    def circuit_breaker_tripped(self) -> bool:
+        """True when consecutive 404s have reached max_consecutive_404 threshold."""
+        return self._circuit_breaker_tripped
+
+    def reset_circuit_breaker(self) -> None:
+        """Reset circuit breaker after force_rediscover is triggered."""
+        self._consecutive_404_count = 0
+        self._circuit_breaker_tripped = False
+        logger.info("clob_circuit_breaker_reset")
 
     # ── Polling Loop ──────────────────────────────────────────
 
@@ -157,7 +173,16 @@ class CLOBFeed:
         return state
 
     async def _fetch_book(self, token_id: str) -> Optional[dict]:
-        """Fetch orderbook for a single token with retry."""
+        """
+        Fetch orderbook for a single token with retry.
+
+        404 responses are treated as a hard signal that the market has expired:
+          - No retry is performed (retrying a dead market wastes time).
+          - Consecutive 404 counter is incremented.
+          - When counter reaches max_consecutive_404, circuit_breaker_tripped is set,
+            signalling main.py to call force_rediscover().
+        All other HTTP or connection errors use the existing exponential backoff retry.
+        """
         for attempt in range(self._max_retries):
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
@@ -165,9 +190,43 @@ class CLOBFeed:
                         f"{self.CLOB_BASE_URL}/book",
                         params={"token_id": token_id},
                     )
+
+                    # ── 404: market expired, no point retrying ────────────
+                    if resp.status_code == 404:
+                        self._consecutive_404_count += 1
+                        logger.warning(
+                            "clob_book_not_found",
+                            token_id=token_id[:16],
+                            consecutive_404s=self._consecutive_404_count,
+                        )
+                        if self._consecutive_404_count >= self._max_consecutive_404:
+                            self._circuit_breaker_tripped = True
+                            logger.error(
+                                "clob_circuit_breaker_tripped",
+                                consecutive_404s=self._consecutive_404_count,
+                                threshold=self._max_consecutive_404,
+                            )
+                        return None  # No retry for 404
+
                     resp.raise_for_status()
+
+                    # Successful fetch — reset 404 counter
+                    self._consecutive_404_count = 0
                     return resp.json()
+
+            except httpx.HTTPStatusError as e:
+                # Non-404 HTTP error — retry with backoff
+                delay = self._backoff_delays[min(attempt, len(self._backoff_delays) - 1)]
+                logger.warning(
+                    "clob_fetch_retry",
+                    attempt=attempt + 1,
+                    token_id=token_id[:16],
+                    error=str(e),
+                    retry_delay=delay,
+                )
+                await asyncio.sleep(delay)
             except httpx.HTTPError as e:
+                # Connection / timeout error — retry with backoff
                 delay = self._backoff_delays[min(attempt, len(self._backoff_delays) - 1)]
                 logger.warning(
                     "clob_fetch_retry",
