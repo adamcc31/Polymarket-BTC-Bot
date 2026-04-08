@@ -43,7 +43,7 @@ file_handler.setFormatter(log_formatter)
 logging.basicConfig(level=logging.INFO, handlers=[stdout_handler, stderr_handler, file_handler])
 logger = logging.getLogger(__name__)
 
-# CONFIG: HARDENED BTC/USD Price Feed ID
+# CONFIG: VERIFIED BTC/USD Price Feed ID (2026 Active)
 BTC_FEED_ID = "0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43"
 PYTH_HERMES_BASE = "https://hermes.pyth.network/v2/updates/price/latest"
 BINANCE_API_URL = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
@@ -64,7 +64,6 @@ class SlowSkewBotV4:
         self.last_minute_ts = None
         self.last_heartbeat = 0
         self.last_tg_heartbeat = 0
-        self.last_telemetry_export = time.time()
         self.is_redundant_mode = False
         self.pyth_fail_count = 0
         
@@ -94,39 +93,101 @@ class SlowSkewBotV4:
             logger.error(f"CLOB Init Failed: {traceback.format_exc()}")
             return False
 
-    def bootstrap_discovery(self):
-        # [REVERTED TO v28 STABLE LOGIC]
+    def bootstrap_discovery(self, max_attempts=5, delay_s=15):
         manual_id = os.environ.get("TARGET_TOKEN_ID")
         if manual_id:
-            logger.info(f"🛡️ MANUAL OVERRIDE: Using Token ID {manual_id}")
             self.yes_token_id = manual_id
+            logger.info(f"Using manual TARGET_TOKEN_ID: {manual_id}")
             return True
 
-        logger.info("Searching for Active Bitcoin target...")
-        try:
-            r = requests.get('https://gamma-api.polymarket.com/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=50', timeout=15)
-            markets = r.json()
-            for m in markets:
-                # v28 question pattern check
-                if ("Bitcoin" in m.get('question', '') or "BTC" in m.get('question', '')) and m.get('clobTokenIds'):
-                    ids = m['clobTokenIds']
+        min_volume = float(os.environ.get("MIN_VOLUME_24HR", 1000.0))
+
+        for attempt in range(1, max_attempts + 1):
+            logger.info(f"Searching for Active Bitcoin target (Attempt {attempt}/{max_attempts})...")
+            try:
+                # Query /markets with high limit to find buried daily price-action
+                r = requests.get(
+                    'https://gamma-api.polymarket.com/markets', 
+                    params={
+                        'active': 'true',
+                        'closed': 'false',
+                        'order': 'volume24hr',
+                        'ascending': 'false',
+                        'limit': 200
+                    },
+                    timeout=10
+                )
+                r.raise_for_status()
+                markets = r.json()
+                
+                candidates = []
+                skipped_reasons = []
+
+                for m in markets:
+                    q = m.get('question', '')
+                    
+                    # 1. Technical filters
+                    if not m.get('active') or m.get('closed') or not m.get('enableOrderBook'):
+                        continue
+                    
+                    # 2. Strict Price-Action Pattern (Above/Up/Down/Below)
+                    q_low = q.lower()
+                    is_btc = "bitcoin" in q_low or "btc" in q_low
+                    is_pa = any(p in q_low for p in ['above', 'up', 'down', 'below'])
+                    
+                    if not (is_btc and is_pa):
+                        if len(skipped_reasons) < 5 and is_btc:
+                            skipped_reasons.append(f"Non-PA: '{q[:40]}...'")
+                        continue
+                            
+                    # 3. Volume Check
+                    vol = float(m.get('volume24hr') or m.get('volume') or 0.0)
+                    if vol < min_volume:
+                        if len(skipped_reasons) < 5:
+                            skipped_reasons.append(f"Low-Vol: '${vol:,.0f}' for '{q[:40]}...'")
+                        continue
+                        
+                    candidates.append({'market': m, 'volume': vol})
+                
+                if not candidates and skipped_reasons:
+                    logger.warning(f"No candidates passed filters. Top rejections: {skipped_reasons}")
+                
+                # Sort by volume descending
+                candidates.sort(key=lambda x: x['volume'], reverse=True)
+                
+                for cand in candidates:
+                    m = cand['market']
+                    ids = m.get('clobTokenIds')
                     if isinstance(ids, str):
                         try: ids = json.loads(ids)
-                        except: ids = [ids.replace('[','').replace(']','').replace('"','').replace(',','')]
+                        except: ids = [ids.replace('[','').replace(']','').replace('"','')]
+                    
                     if not ids: continue
                     tid = ids[0]
+                    
                     try:
-                        logger.info(f"Auditing '{m['question'][:40]}...' | Token: {tid}")
+                        # Validate token with a quick orderbook pull
                         self.clob_client.get_order_book(tid)
                         self.yes_token_id = tid
                         self.target_market_name = m.get('question', 'Unknown Bitcoin Market')
-                        logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_name}")
+                        logger.info(f"🎯 LIQUID TARGET FOUND: {self.target_market_name} (Vol: ${cand['volume']:,.2f})")
                         return True
-                    except: continue
-            return False
-        except Exception as e:
-            logger.error(f"Discovery error: {e}")
-            return False
+                    except Exception as e:
+                        logger.debug(f"Token {tid} invalid: {e}")
+                        continue
+                
+                if attempt < max_attempts:
+                    logger.warning(f"No valid targets found on attempt {attempt}. Retrying in {delay_s}s...")
+                    time.sleep(delay_s)
+                else:
+                    logger.error("All discovery attempts exhausted.")
+                    
+            except Exception as e:
+                logger.error(f"Discovery attempt {attempt} error: {e}")
+                if attempt < max_attempts:
+                    time.sleep(delay_s)
+        
+        return False
 
     async def send_alert(self, session, title, message):
         tg_token = os.environ.get("TELEGRAM_TOKEN")
@@ -139,28 +200,6 @@ class SlowSkewBotV4:
                     if resp.status == 200: return
             except: pass
 
-    async def push_telemetry_file(self, session):
-        """[MODUL TELEMETRY v29]"""
-        tg_token = os.environ.get("TELEGRAM_TOKEN")
-        tg_chat = os.environ.get("TELEGRAM_CHAT_ID")
-        if not (tg_token and tg_chat) or not os.path.exists(self.telemetry_file):
-            return
-        try:
-            logger.info("📤 Pushing telemetry CSV to Telegram...")
-            url = f"https://api.telegram.org/bot{tg_token}/sendDocument"
-            data = aiohttp.FormData()
-            data.add_field('chat_id', tg_chat)
-            data.add_field('caption', f"📊 Telemetry Export: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-            with open(self.telemetry_file, 'rb') as f:
-                data.add_field('document', f, filename=os.path.basename(self.telemetry_file))
-                async with session.post(url, data=data, timeout=30) as resp:
-                    if resp.status == 200:
-                        logger.info("✅ Telemetry CSV sent successfully.")
-                        return True
-        except Exception as e:
-            logger.error(f"Telemetry push failed: {e}")
-        return False
-
     async def get_binance_price(self, session):
         try:
             async with session.get(BINANCE_API_URL, timeout=5) as resp:
@@ -171,7 +210,8 @@ class SlowSkewBotV4:
         except Exception: return None
 
     async def get_pyth_price(self, session):
-        # [REVERTED TO v28 STABLE LOGIC]
+        """Primary Oracle: V2 Hermes with Verified Feed ID."""
+        # Querying with encoded array param correctly
         params = {"ids[]": [BTC_FEED_ID]}
         try:
             async with session.get(PYTH_HERMES_BASE, params=params, timeout=10) as resp:
@@ -179,6 +219,8 @@ class SlowSkewBotV4:
                     data = await resp.json()
                     self.pyth_fail_count = 0
                     self.is_redundant_mode = False
+                    
+                    # Hermes V2 response parsing
                     parsed = data.get('parsed', []) if isinstance(data, dict) else []
                     if parsed:
                         p_info = parsed[0].get('price', {})
@@ -188,16 +230,18 @@ class SlowSkewBotV4:
                             return float(raw_px) * (10 ** int(expo))
                 else:
                     logger.warning(f"Pyth Primary failed ({resp.status}). Activating Binance Fallback...")
-        except Exception: pass
+        except Exception as e:
+            logger.debug(f"Pyth Error: {e}")
+        
         self.pyth_fail_count += 1
         self.is_redundant_mode = True
         return await self.get_binance_price(session)
 
     async def main_loop(self):
         async with aiohttp.ClientSession() as session:
-            logger.info("🟢 CLOUD BOT ACTIVE (v30: Stabilized + Telemetry).")
-            await self.send_alert(session, "[SYSTEM RESTORED]", 
-                                 f"Bot returned to v28 Discovery logic.\nTarget: `{self.target_market_name}`")
+            logger.info("🟢 CLOUD BOT ACTIVE (v28: Verified Ingest).")
+            await self.send_alert(session, "[SYSTEM ONLINE]", 
+                                 f"Verified Feed ID: {BTC_FEED_ID[:10]}...\nTarget: `{self.target_market_name}`")
             
             while True:
                 try:
@@ -218,11 +262,6 @@ class SlowSkewBotV4:
                         await self.send_alert(session, "[HEARTBEAT]", f"BTC Stable: ${price:,.2f}")
                         self.last_tg_heartbeat = time.time()
 
-                    # Telemetry push (5h)
-                    if time.time() - self.last_telemetry_export > 18000:
-                        if await self.push_telemetry_file(session):
-                            self.last_telemetry_export = time.time()
-
                     if self.last_minute_ts and current_minute > self.last_minute_ts:
                         momentum = price - self.last_minute_price
                         self.price_buffer.append(momentum)
@@ -234,6 +273,8 @@ class SlowSkewBotV4:
                         logger.info(f"Baseline set: ${price:,.2f}")
                     
                     self.last_minute_ts = current_minute
+                    
+                    # Intelligent Polling: 15s base + backoff for failed Pyth
                     backoff_delay = min(self.pyth_fail_count * 15, 60) if self.is_redundant_mode else 0
                     await asyncio.sleep(15 + backoff_delay)
                 except Exception as e:
@@ -244,8 +285,10 @@ class SlowSkewBotV4:
         if len(self.price_buffer) < 2: return
         history = list(self.price_buffer)
         margin_mult = 1.001 if self.is_redundant_mode else 1.0
+        
         mu, sigma = np.mean(history), np.std(history)
         if sigma < 1e-9: return
+        
         z = (history[-1] - mu) / sigma
         eff_threshold = self.z_threshold * margin_mult
         
