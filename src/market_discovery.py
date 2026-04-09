@@ -474,6 +474,33 @@ class MarketDiscovery:
             )
             question = market_data.get("question", "")
 
+            # Parse timestamps early to enforce horizon limits
+            end_date_str = market_data.get("end_date_iso") or market_data.get("endDate", "")
+            created_str = market_data.get("startDateIso") or market_data.get("startDate") or market_data.get("createdAt", "")
+
+            if not end_date_str or not created_str:
+                return None
+
+            T_resolution = self._parse_timestamp(end_date_str)
+            T_open = self._parse_timestamp(created_str)
+
+            if T_resolution is None or T_open is None:
+                return None
+
+            lifespan_minutes = (T_resolution - T_open).total_seconds() / 60.0
+            
+            # Enforce strictly short-horizon markets (skip Dailies/Weeklies)
+            target_horizons = self._config.get("market_discovery.target_horizons_minutes", [5.0])
+            max_horizon = max(target_horizons) * 3.0  # Max 15 minutes for a 5min target
+            if lifespan_minutes > max_horizon:
+                return None  # Silently skip long-horizon markets
+
+            now = datetime.now(timezone.utc)
+            ttr_minutes = (T_resolution - now).total_seconds() / 60.0
+
+            if ttr_minutes <= 0:
+                return None
+                
             # Extract strike price from question text
             strike_price = self._extract_strike_price(question)
             if strike_price is None:
@@ -492,6 +519,7 @@ class MarketDiscovery:
                         "unsupported_market_type_no_strike",
                         market_id=market_id,
                         question=question,
+                        lifespan=lifespan_minutes
                     )
                 else:
                     logger.warning(
@@ -500,30 +528,6 @@ class MarketDiscovery:
                         question=question,
                     )
                 return None
-
-            # Parse timestamps
-            end_date_str = market_data.get("end_date_iso") or market_data.get("endDate", "")
-            created_str = market_data.get("created_at") or market_data.get("createdAt", "")
-
-            if not end_date_str:
-                return None
-
-            T_resolution = self._parse_timestamp(end_date_str)
-            T_open = self._parse_timestamp(created_str) if created_str else None
-
-            if T_resolution is None:
-                return None
-
-            now = datetime.now(timezone.utc)
-            ttr_minutes = (T_resolution - now).total_seconds() / 60.0
-
-            if ttr_minutes <= 0:
-                return None
-
-            if T_open is None:
-                # Estimate T_open as T_resolution - 15 minutes
-                from datetime import timedelta
-                T_open = T_resolution - timedelta(minutes=15)
 
             # Extract CLOB token IDs
             tokens = market_data.get("tokens", [])
