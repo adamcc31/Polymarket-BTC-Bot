@@ -3,14 +3,24 @@
   "_version": "1.0.0",
   "regime": {
     "vol_lower_threshold": 0.15,
-    "vol_upper_threshold": 0.80,
+    "vol_upper_threshold": 0.8,
     "binance_spread_max_bps": 5.0,
     "binance_min_depth_btc": 0.5
   },
   "signal": {
     "margin_of_safety": 0.05,
     "ttr_min_minutes": 5.0,
-    "ttr_max_minutes": 12.0
+    "ttr_max_minutes": 12.0,
+    "dynamic_ttr_enabled": true,
+    "entry_window_short_min_minutes": 5.0,
+    "entry_window_short_max_minutes": 60.0,
+    "entry_window_medium_min_minutes": 30.0,
+    "entry_window_medium_max_minutes": 240.0,
+    "entry_window_long_min_minutes": 60.0,
+    "entry_window_long_max_minutes": 720.0,
+    "probability_source": "fair",
+    "hybrid_fair_weight": 0.7,
+    "hybrid_model_weight": 0.3
   },
   "clob": {
     "min_depth_usd": 10.0,
@@ -21,8 +31,8 @@
   },
   "risk": {
     "kelly_divisor": 2,
-    "max_bet_fraction": 0.10,
-    "min_bet_usd": 1.00,
+    "max_bet_fraction": 0.1,
+    "min_bet_usd": 1.0,
     "daily_loss_limit_pct": 0.05,
     "session_loss_limit_pct": 0.03,
     "consecutive_loss_multiplier": 0.15,
@@ -30,8 +40,8 @@
   },
   "dry_run": {
     "pass_win_rate": 0.53,
-    "pass_profit_factor": 1.10,
-    "pass_dry_run_score": 0.70,
+    "pass_profit_factor": 1.1,
+    "pass_dry_run_score": 0.7,
     "pass_max_drawdown": -0.15,
     "min_trades_per_session": 10,
     "go_live_consecutive_pass": 5,
@@ -39,14 +49,15 @@
     "abort_consecutive_fail": 3,
     "abort_win_rate_threshold": 0.48,
     "abort_consecutive_losses": 6,
-    "max_duration_hours": 48
+    "max_duration_hours": 48,
+    "abstain_summary_every_signals": 25
   },
   "model": {
-    "retrain_win_rate_trigger": 0.50,
+    "retrain_win_rate_trigger": 0.5,
     "retrain_brier_trigger": 0.245,
     "retrain_consecutive_sessions": 2,
-    "ensemble_lgbm_weight": 0.70,
-    "ensemble_logreg_weight": 0.30,
+    "ensemble_lgbm_weight": 0.7,
+    "ensemble_logreg_weight": 0.3,
     "calibration_method": "isotonic"
   },
   "observability": {
@@ -73,7 +84,25 @@
     "late_ttr_minutes": 3.0,
     "rotation_ttr_buffer_minutes": 5.0,
     "tag_slug": "bitcoin",
-    "min_volume_24hr": 1000.0
+    "min_volume_24hr": 1000.0,
+    "strike_distance_soft_cap_pct": 0.2,
+    "strike_distance_hard_cap_pct": 0.5,
+    "hard_penalty_absurd_strike": 0.3,
+    "target_horizons_minutes": [
+      120.0,
+      240.0,
+      480.0
+    ],
+    "weight_volume": 0.25,
+    "weight_prob": 0.2,
+    "weight_ttr": 0.15,
+    "weight_strike": 0.25,
+    "weight_horizon": 0.15
+  },
+  "rotation": {
+    "min_dwell_minutes": 20.0,
+    "freeze_when_in_entry_window": true,
+    "cooldown_after_trade_minutes": 10.0
   },
   "telegram": {
     "enabled": true,

@@ -96,6 +96,8 @@ class DryRunEngine:
             reason = signal.abstain_reason or "NO_EDGE"
             if reason in self._abstain_reasons:
                 self._abstain_reasons[reason] += 1
+            else:
+                self._abstain_reasons[reason] = self._abstain_reasons.get(reason, 0) + 1
 
         # Track for Brier score
         self._all_predictions.append({
@@ -103,6 +105,18 @@ class DryRunEngine:
             "market_id": signal.market_id,
             "timestamp": signal.timestamp,
         })
+
+        summary_every = int(self._config.get("dry_run.abstain_summary_every_signals", 25))
+        if summary_every > 0 and self._signals_evaluated % summary_every == 0:
+            logger.info(
+                "abstain_reason_summary",
+                signals_evaluated=self._signals_evaluated,
+                signals_abstained=self._signals_abstained,
+                abstain_rate=round(
+                    self._signals_abstained / max(1, self._signals_evaluated), 4
+                ),
+                abstain_reasons=dict(self._abstain_reasons),
+            )
 
     def simulate_trade(
         self,

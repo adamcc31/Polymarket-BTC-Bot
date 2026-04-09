@@ -64,3 +64,37 @@ class TelegramNotifier:
                 # Never fail the trading engine if Telegram errors.
                 return
 
+    async def send_document(
+        self,
+        file_path: str,
+        caption: str = "",
+        disable_notification: bool = False,
+    ) -> None:
+        if not self._enabled or not self._token or not self._chat_id:
+            return
+        
+        url = f"https://api.telegram.org/bot{self._token}/sendDocument"
+        data = {
+            "chat_id": str(self._chat_id),
+            "caption": caption,
+            "disable_notification": disable_notification,
+        }
+        
+        import os
+        if not os.path.exists(file_path):
+            return
+
+        # Prepare multipart/form-data for the file
+        files = {
+            "document": (os.path.basename(file_path), open(file_path, "rb"))
+        }
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                resp = await client.post(url, data=data, files=files)
+                resp.raise_for_status()
+            except Exception:
+                pass
+            finally:
+                files["document"][1].close()
+

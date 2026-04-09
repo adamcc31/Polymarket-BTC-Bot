@@ -75,6 +75,8 @@ class MarketDiscovery:
         self._config = config
         self._state = DiscoveryState.SEARCHING
         self._active_market: Optional[ActiveMarket] = None
+        self._active_since: Optional[datetime] = None
+        self._last_trade_at: Optional[datetime] = None
         self._poll_interval = config.get("market_discovery.poll_interval_s", 30)
         self._waiting_poll = config.get("market_discovery.waiting_poll_s", 60)
         self._min_ttr = config.get("market_discovery.min_ttr_to_discover", 5.0)
@@ -129,6 +131,7 @@ class MarketDiscovery:
         market = await self._find_active_market()
         if market:
             self._active_market = market
+            self._active_since = datetime.now(timezone.utc)
             self._state = DiscoveryState.ACTIVE
             logger.info(
                 "market_discovered",
@@ -191,6 +194,7 @@ class MarketDiscovery:
         market = await self._find_active_market()
         if market:
             self._active_market = market
+            self._active_since = datetime.now(timezone.utc)
             self._state = DiscoveryState.ACTIVE
             logger.info(
                 "market_found_from_waiting",
@@ -212,7 +216,12 @@ class MarketDiscovery:
             previous_market=self._active_market.market_id if self._active_market else None,
         )
         self._active_market = None
+        self._active_since = None
         self._state = DiscoveryState.SEARCHING
+
+    def mark_trade_executed(self) -> None:
+        """Called by orchestrator when a trade is actually opened."""
+        self._last_trade_at = datetime.now(timezone.utc)
 
     async def check_and_rotate(self) -> bool:
         """
@@ -230,6 +239,50 @@ class MarketDiscovery:
         """
         if not self._active_market:
             return False
+
+        now = datetime.now(timezone.utc)
+        # Rotation lock 1: minimum dwell time on active market
+        min_dwell = float(self._config.get("rotation.min_dwell_minutes", 20.0))
+        if self._active_since is not None:
+            dwell_minutes = (now - self._active_since).total_seconds() / 60.0
+            if dwell_minutes < min_dwell:
+                logger.info(
+                    "rotation_locked_dwell",
+                    dwell_minutes=round(dwell_minutes, 2),
+                    min_dwell_minutes=min_dwell,
+                    active_market_id=self._active_market.market_id,
+                )
+                return False
+
+        # Rotation lock 2: freeze while current market is still in valid entry window
+        freeze_entry_window = bool(
+            self._config.get("rotation.freeze_when_in_entry_window", True)
+        )
+        if freeze_entry_window:
+            ttr_min, ttr_max = self._resolve_signal_ttr_window(self._active_market)
+            cur_ttr = float(self._active_market.TTR_minutes)
+            if ttr_min <= cur_ttr <= ttr_max:
+                logger.info(
+                    "rotation_locked_entry_window",
+                    market_id=self._active_market.market_id,
+                    TTR_minutes=round(cur_ttr, 2),
+                    ttr_min=ttr_min,
+                    ttr_max=ttr_max,
+                )
+                return False
+
+        # Rotation lock 3: cooldown after a real trade
+        cooldown = float(self._config.get("rotation.cooldown_after_trade_minutes", 0.0))
+        if cooldown > 0 and self._last_trade_at is not None:
+            since_trade = (now - self._last_trade_at).total_seconds() / 60.0
+            if since_trade < cooldown:
+                logger.info(
+                    "rotation_locked_trade_cooldown",
+                    minutes_since_trade=round(since_trade, 2),
+                    cooldown_minutes=cooldown,
+                    active_market_id=self._active_market.market_id,
+                )
+                return False
 
         candidates = await self._query_candidates()
         if not candidates:
@@ -266,6 +319,7 @@ class MarketDiscovery:
         )
 
         self._active_market = new_market
+        self._active_since = datetime.now(timezone.utc)
         return True
 
     # ── Market Discovery Logic ────────────────────────────────
@@ -295,6 +349,7 @@ class MarketDiscovery:
         Uses a high limit (200) to find daily markets even if buried in volume.
         """
         min_volume = self._config.get("market_discovery.min_volume_24hr", 1000.0)
+        spot_price = await self._fetch_binance_spot()
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
@@ -362,13 +417,19 @@ class MarketDiscovery:
                             continue
 
                         yes_prob = self._extract_yes_probability(m)
-                        score = self._score_candidate(parsed, volume, yes_prob)
+                        score_components = self._score_candidate(
+                            market=parsed,
+                            volume_24h=volume,
+                            yes_prob=yes_prob,
+                            spot_price=spot_price,
+                        )
                         candidates.append(
                             {
                                 "market": parsed,
                                 "volume": volume,
                                 "yes_prob": yes_prob,
-                                "score": score,
+                                "score": score_components["score_total"],
+                                "score_components": score_components,
                             }
                         )
 
@@ -545,12 +606,15 @@ class MarketDiscovery:
         market: ActiveMarket,
         volume_24h: float,
         yes_prob: Optional[float],
-    ) -> float:
+        spot_price: Optional[float],
+    ) -> dict[str, float]:
         """
         Rank multiple tradable markets:
         - liquidity signal from log(volume)
         - probability proximity to configurable target (default 0.5)
         - TTR proximity to target duration
+        - strike rationality vs spot
+        - horizon alignment fit
         """
         volume_score = max(0.0, min(1.0, math.log1p(max(0.0, volume_24h)) / 12.0))
 
@@ -562,8 +626,102 @@ class MarketDiscovery:
         ttr_delta = abs(market.TTR_minutes - self._target_ttr_minutes)
         ttr_score = max(0.0, 1.0 - (ttr_delta / max(30.0, self._target_ttr_minutes)))
 
-        # Weighted sum, conservative and monotone.
-        return (0.45 * volume_score) + (0.35 * prob_score) + (0.20 * ttr_score)
+        # Additional rationality score: strike should not be absurdly far from spot
+        strike_score = 0.5
+        horizon_score = 0.5
+        hard_penalty = 0.0
+        if spot_price is not None and spot_price > 0:
+            strike_dist_pct = abs(market.strike_price - spot_price) / spot_price
+            strike_soft_cap = float(
+                self._config.get("market_discovery.strike_distance_soft_cap_pct", 0.20)
+            )
+            strike_hard_cap = float(
+                self._config.get("market_discovery.strike_distance_hard_cap_pct", 0.50)
+            )
+            strike_score = max(0.0, 1.0 - (strike_dist_pct / max(1e-6, strike_soft_cap)))
+            if strike_dist_pct > strike_hard_cap:
+                hard_penalty = float(
+                    self._config.get("market_discovery.hard_penalty_absurd_strike", 0.30)
+                )
+
+        target_horizons = self._config.get(
+            "market_discovery.target_horizons_minutes", [60.0, 240.0, 480.0, 720.0]
+        )
+        if isinstance(target_horizons, list) and target_horizons:
+            try:
+                targets = [float(v) for v in target_horizons if float(v) > 0]
+            except Exception:
+                targets = [60.0, 240.0, 480.0, 720.0]
+            nearest = min(abs(market.TTR_minutes - t) for t in targets) if targets else 0.0
+            denom = max(30.0, min(targets) if targets else 60.0)
+            horizon_score = max(0.0, 1.0 - (nearest / denom))
+
+        w_volume = float(self._config.get("market_discovery.weight_volume", 0.25))
+        w_prob = float(self._config.get("market_discovery.weight_prob", 0.20))
+        w_ttr = float(self._config.get("market_discovery.weight_ttr", 0.15))
+        w_strike = float(self._config.get("market_discovery.weight_strike", 0.25))
+        w_horizon = float(self._config.get("market_discovery.weight_horizon", 0.15))
+
+        weighted = (
+            (w_volume * volume_score)
+            + (w_prob * prob_score)
+            + (w_ttr * ttr_score)
+            + (w_strike * strike_score)
+            + (w_horizon * horizon_score)
+        )
+        score_total = max(0.0, weighted - hard_penalty)
+        return {
+            "score_total": score_total,
+            "volume_score": volume_score,
+            "prob_score": prob_score,
+            "ttr_score": ttr_score,
+            "strike_score": strike_score,
+            "horizon_score": horizon_score,
+            "hard_penalty": hard_penalty,
+        }
+
+    async def _fetch_binance_spot(self) -> Optional[float]:
+        """Low-latency spot reference for market rationality checks."""
+        url = "https://api.binance.com/api/v3/ticker/price"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, params={"symbol": "BTCUSDT"})
+                resp.raise_for_status()
+                payload = resp.json()
+                price = float(payload.get("price", 0.0))
+                return price if price > 0 else None
+        except Exception:
+            return None
+
+    def _resolve_signal_ttr_window(self, market: ActiveMarket) -> tuple[float, float]:
+        """
+        Mirror signal-generator dynamic TTR policy at discovery layer,
+        so rotation lock can honor valid entry windows.
+        """
+        dyn_enabled = bool(self._config.get("signal.dynamic_ttr_enabled", True))
+        if not dyn_enabled:
+            ttr_min = float(self._config.get("signal.ttr_min_minutes", 5.0))
+            ttr_max = float(self._config.get("signal.ttr_max_minutes", 12.0))
+            return ttr_min, ttr_max
+
+        lifespan_h = max(
+            0.0,
+            (market.T_resolution - market.T_open).total_seconds() / 3600.0,
+        )
+        if lifespan_h <= 2.0:
+            return (
+                float(self._config.get("signal.entry_window_short_min_minutes", 5.0)),
+                float(self._config.get("signal.entry_window_short_max_minutes", 45.0)),
+            )
+        if lifespan_h <= 8.0:
+            return (
+                float(self._config.get("signal.entry_window_medium_min_minutes", 30.0)),
+                float(self._config.get("signal.entry_window_medium_max_minutes", 240.0)),
+            )
+        return (
+            float(self._config.get("signal.entry_window_long_min_minutes", 60.0)),
+            float(self._config.get("signal.entry_window_long_max_minutes", 720.0)),
+        )
 
     @staticmethod
     def _extract_token_ids(tokens: list, market_data: dict) -> dict:

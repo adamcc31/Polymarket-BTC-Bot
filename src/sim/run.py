@@ -78,9 +78,20 @@ def _ms_to_dt(ms: float) -> datetime:
     return datetime.fromtimestamp(float(ms) / 1000.0, tz=timezone.utc)
 
 
-def _ttr_phase(ttr_minutes: float, cfg: ConfigManager) -> str:
-    ttr_min = float(cfg.get("signal.ttr_min_minutes", 5.0))
-    ttr_max = float(cfg.get("signal.ttr_max_minutes", 12.0))
+def _ttr_phase(ttr_minutes: float, cfg: ConfigManager, lifespan_h: float = 0.25) -> str:
+    dyn_enabled = bool(cfg.get("signal.dynamic_ttr_enabled", True))
+    if not dyn_enabled:
+        ttr_min = float(cfg.get("signal.ttr_min_minutes", 5.0))
+        ttr_max = float(cfg.get("signal.ttr_max_minutes", 12.0))
+    elif lifespan_h <= 2.0:
+        ttr_min = float(cfg.get("signal.entry_window_short_min_minutes", 5.0))
+        ttr_max = float(cfg.get("signal.entry_window_short_max_minutes", 60.0))
+    elif lifespan_h <= 8.0:
+        ttr_min = float(cfg.get("signal.entry_window_medium_min_minutes", 30.0))
+        ttr_max = float(cfg.get("signal.entry_window_medium_max_minutes", 240.0))
+    else:
+        ttr_min = float(cfg.get("signal.entry_window_long_min_minutes", 60.0))
+        ttr_max = float(cfg.get("signal.entry_window_long_max_minutes", 720.0))
     if ttr_minutes > ttr_max:
         return "EARLY"
     if ttr_minutes >= ttr_min:
@@ -88,24 +99,88 @@ def _ttr_phase(ttr_minutes: float, cfg: ConfigManager) -> str:
     return "LATE"
 
 
-def _reconstruct_clob_state(row: Dict[str, Any], market_id: str, cfg: ConfigManager, ts: datetime) -> CLOBState:
-    yes_mid = float(row["clob_yes_mid"])
-    yes_spread = float(row["clob_yes_spread"])
-    no_spread = float(row["clob_no_spread"])
-    market_vig = float(row["market_vig"])
+def _reconstruct_clob_state(
+    row: Dict[str, Any],
+    market_id: str,
+    cfg: ConfigManager,
+    ts: datetime,
+    fair_prob: Optional[float] = None,
+) -> CLOBState:
+    """
+    Build a realistic CLOB snapshot for simulation.
 
-    yes_bid = yes_mid - yes_spread / 2.0
-    yes_ask = yes_mid + yes_spread / 2.0
+    If fair_prob is provided (preferred), we simulate a market-maker who prices
+    around the fair value with a configurable vig and random spread jitter.
+    This prevents the artificial edge that arises when CLOB is stuck at 0.50
+    while fair prob says 0.95.
 
-    # Use vig definition: yes_ask + no_ask - 1.0 = market_vig
-    no_ask = 1.0 - market_vig - yes_ask
-    no_bid = no_ask - no_spread
+    Market-maker model:
+      - MM sets YES mid ≈ fair_prob + noise
+      - Spread drawn from [base_spread, base_spread * 3] to simulate variable
+        liquidity conditions (tight near 0.50, wider at extremes)
+      - Vig applied symmetrically
+    """
+    import random
 
-    # Clamp into [0,1] for safety.
-    yes_bid = max(0.0, min(1.0, yes_bid))
-    yes_ask = max(0.0, min(1.0, yes_ask))
-    no_bid = max(0.0, min(1.0, no_bid))
-    no_ask = max(0.0, min(1.0, no_ask))
+    base_vig = float(cfg.get("sim.mm_base_vig", 0.04))
+    base_spread = float(cfg.get("sim.mm_base_spread", 0.02))
+    spread_noise_pct = float(cfg.get("sim.mm_spread_noise_pct", 0.50))
+
+    if fair_prob is not None and 0.0 < fair_prob < 1.0:
+
+        mm_noise_sigma = float(cfg.get("sim.mm_noise_sigma", 0.08))
+        mm_lag_probability = float(cfg.get("sim.mm_lag_probability", 0.25))
+        mm_lag_sigma = float(cfg.get("sim.mm_lag_sigma", 0.05))
+
+        # Market-maker pricing with two sources of imperfection:
+        #
+        # 1. Estimation noise: MM doesn't compute the same fair value as us.
+        #    On Polymarket (retail-heavy, not HFT), MMs are slower and less
+        #    precise. σ=0.08 means ±8% disagreement 1-sigma.
+        #
+        # 2. Latency lag: With probability mm_lag_probability, the MM is using
+        #    a stale fair estimate (lagged). This is the "slow skew" edge —
+        #    our Binance-derived fair prob updates faster than CLOB reprices.
+        mm_noise = random.gauss(0, mm_noise_sigma)
+
+        if random.random() < mm_lag_probability:
+            # MM is lagging — additional offset toward 0.50 (stale price)
+            lag_pull = mm_lag_sigma * (0.5 - fair_prob)  # pulls toward center
+            mm_noise += lag_pull
+
+        mm_fair = max(0.02, min(0.98, fair_prob + mm_noise))
+
+        # Spread model: Polymarket spreads are typically 2-6 cents.
+        # Slightly wider at extremes but not dramatically so (unlike TradFi).
+        extremity = abs(mm_fair - 0.5) * 2.0  # 0 at center, 1 at extremes
+        spread = base_spread * (1.0 + extremity * 0.8)  # moderate widening
+        spread *= (1.0 + random.uniform(-spread_noise_pct, spread_noise_pct))
+        spread = max(0.01, min(0.10, spread))
+
+        yes_ask = min(0.99, mm_fair + spread / 2.0 + base_vig / 2.0)
+        yes_bid = max(0.01, mm_fair - spread / 2.0)
+        no_ask = min(0.99, (1.0 - mm_fair) + spread / 2.0 + base_vig / 2.0)
+        no_bid = max(0.01, (1.0 - mm_fair) - spread / 2.0)
+
+        market_vig = max(0.0, (yes_ask + no_ask) - 1.0)
+    else:
+        # Fallback: use dataset values (legacy path)
+        yes_mid = float(row["clob_yes_mid"])
+        yes_spread = float(row["clob_yes_spread"])
+        no_spread = float(row["clob_no_spread"])
+        market_vig = float(row["market_vig"])
+
+        yes_bid = yes_mid - yes_spread / 2.0
+        yes_ask = yes_mid + yes_spread / 2.0
+        no_ask = 1.0 - market_vig - yes_ask
+        no_bid = no_ask - no_spread
+
+    # Clamp into [0.01, 0.99] for safety.
+    yes_bid = max(0.01, min(0.99, yes_bid))
+    yes_ask = max(0.01, min(0.99, yes_ask))
+    no_bid = max(0.01, min(0.99, no_bid))
+    no_ask = max(0.01, min(0.99, no_ask))
+    market_vig = max(0.0, (yes_ask + no_ask) - 1.0)
 
     max_vig = float(cfg.get("clob.max_market_vig", 0.07))
     is_liquid = market_vig <= max_vig
@@ -140,6 +215,10 @@ def _build_feature_vector(row: Dict[str, Any], now_ts: datetime, cfg: ConfigMana
         values.append(float(v))
 
     ttr_minutes = float(row["TTR_minutes"])
+    # Compute lifespan for dynamic TTR window classification
+    t_resolution = _ms_to_dt(row["t_resolution_ms"])
+    t_open = t_resolution - timedelta(minutes=max(15.0, ttr_minutes + 15.0))
+    lifespan_h = max(0.0, (t_resolution - t_open).total_seconds() / 3600.0)
     md = FeatureMetadata(
         timestamp=now_ts,
         bar_close_time=now_ts,
@@ -147,7 +226,7 @@ def _build_feature_vector(row: Dict[str, Any], now_ts: datetime, cfg: ConfigMana
         strike_price=float(row["strike_price"]),
         current_btc_price=float(row["btc_at_signal"]),
         TTR_minutes=ttr_minutes,
-        TTR_phase=_ttr_phase(ttr_minutes, cfg),
+        TTR_phase=_ttr_phase(ttr_minutes, cfg, lifespan_h=lifespan_h),
         compute_lag_ms=0.0,
     )
 
@@ -229,8 +308,6 @@ async def run_backtest(
 
         # Circuit: if signal happened while a position is open, risk manager will reject.
         # Still record the signal for calibration/prediction tracking.
-        clob_state = _reconstruct_clob_state(row, active_market.market_id, effective_cfg, sig_ts)
-        fv = _build_feature_vector(row, sig_ts, effective_cfg)
 
         sigma_override = float(row["RV"]) if row.get("RV") is not None else None
         if isinstance(sigma_override, float) and math.isnan(sigma_override):
@@ -239,14 +316,46 @@ async def run_backtest(
             sigma_override = float(cfg.get("fair_prob.sigma_default_ann", 0.30))
 
         fake_feed = FakeBinanceFeed(latest_price=float(row["btc_at_signal"]))
+
+        # PHASE 1: Compute fair probability with a minimal placeholder CLOB.
+        # fair_engine only uses clob_state.market_vig for uncertainty scaling,
+        # so a neutral placeholder is acceptable here.
+        placeholder_clob = CLOBState(
+            market_id=active_market.market_id,
+            timestamp=sig_ts,
+            yes_ask=0.51, yes_bid=0.49,
+            no_ask=0.51, no_bid=0.49,
+            yes_depth_usd=1e6, no_depth_usd=1e6,
+            market_vig=0.02, is_liquid=True, is_stale=False,
+        )
+        fair_initial = fair_engine.compute(
+            binance_feed=fake_feed,
+            active_market=active_market,
+            clob_state=placeholder_clob,
+            sigma_ann_override=sigma_override,
+            data_confidence_override=1.0,
+            as_of_time=sig_ts,
+        )
+
+        # PHASE 2: Build realistic CLOB centered on fair probability.
+        # A rational market-maker prices around q_fair, NOT at a static 0.50.
+        clob_state = _reconstruct_clob_state(
+            row, active_market.market_id, effective_cfg, sig_ts,
+            fair_prob=fair_initial.q_fair,
+        )
+
+        # PHASE 3: Re-compute fair with realistic CLOB (for correct uncertainty).
         fair = fair_engine.compute(
-            binance_feed=fake_feed,  # sigma is overridden from dataset RV
+            binance_feed=fake_feed,
             active_market=active_market,
             clob_state=clob_state,
             sigma_ann_override=sigma_override,
             data_confidence_override=1.0,
             as_of_time=sig_ts,
         )
+
+        # Build feature vector with realistic CLOB values baked in
+        fv = _build_feature_vector(row, sig_ts, effective_cfg)
 
         signal = signal_gen.evaluate(
             P_model=fair.q_fair,

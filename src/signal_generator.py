@@ -43,6 +43,34 @@ class SignalGenerator:
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
 
+    def _resolve_ttr_window(self, active_market: ActiveMarket) -> tuple[float, float]:
+        """Dynamic TTR entry window aligned with market horizon."""
+        dyn_enabled = bool(self._config.get("signal.dynamic_ttr_enabled", True))
+        if not dyn_enabled:
+            return (
+                float(self._config.get("signal.ttr_min_minutes", 5.0)),
+                float(self._config.get("signal.ttr_max_minutes", 12.0)),
+            )
+
+        lifespan_h = max(
+            0.0,
+            (active_market.T_resolution - active_market.T_open).total_seconds() / 3600.0,
+        )
+        if lifespan_h <= 2.0:
+            return (
+                float(self._config.get("signal.entry_window_short_min_minutes", 5.0)),
+                float(self._config.get("signal.entry_window_short_max_minutes", 45.0)),
+            )
+        if lifespan_h <= 8.0:
+            return (
+                float(self._config.get("signal.entry_window_medium_min_minutes", 30.0)),
+                float(self._config.get("signal.entry_window_medium_max_minutes", 240.0)),
+            )
+        return (
+            float(self._config.get("signal.entry_window_long_min_minutes", 60.0)),
+            float(self._config.get("signal.entry_window_long_max_minutes", 720.0)),
+        )
+
     def evaluate(
         self,
         P_model: float,
@@ -96,6 +124,12 @@ class SignalGenerator:
                 # If configured to hard-abstain, stop immediately regardless of TTR.
                 edge_yes = P_model - clob_state.yes_ask
                 edge_no = (1.0 - P_model) - clob_state.no_ask
+                logger.info(
+                    "signal_abstain_basis_risk",
+                    policy=non_binance_policy,
+                    settlement_exchange=active_market.settlement_exchange,
+                    settlement_granularity=active_market.settlement_granularity,
+                )
                 return SignalResult(
                     signal="ABSTAIN",
                     abstain_reason="BASIS_RISK_BLOCK",
@@ -121,6 +155,14 @@ class SignalGenerator:
             if metadata.TTR_minutes < non_binance_abstain_ttr_min:
                 edge_yes = P_model - clob_state.yes_ask
                 edge_no = (1.0 - P_model) - clob_state.no_ask
+                logger.info(
+                    "signal_abstain_basis_risk",
+                    policy=non_binance_policy,
+                    TTR_minutes=round(metadata.TTR_minutes, 2),
+                    min_ttr=non_binance_abstain_ttr_min,
+                    settlement_exchange=active_market.settlement_exchange,
+                    settlement_granularity=active_market.settlement_granularity,
+                )
                 return SignalResult(
                     signal="ABSTAIN",
                     abstain_reason="BASIS_RISK_BLOCK",
@@ -147,8 +189,7 @@ class SignalGenerator:
             u_used = uncertainty_u * non_binance_u_mult
 
         # ── STEP 1: TTR GATE ─────────────────────────────────
-        ttr_min = self._config.get("signal.ttr_min_minutes", 5.0)
-        ttr_max = self._config.get("signal.ttr_max_minutes", 12.0)
+        ttr_min, ttr_max = self._resolve_ttr_window(active_market)
         ttr = metadata.TTR_minutes
 
         if ttr < ttr_min or ttr > ttr_max:
@@ -158,6 +199,8 @@ class SignalGenerator:
                 "signal_abstain_ttr",
                 TTR_minutes=round(ttr, 2),
                 phase=metadata.TTR_phase,
+                ttr_min=ttr_min,
+                ttr_max=ttr_max,
             )
             return SignalResult(
                 signal="ABSTAIN",
@@ -241,6 +284,13 @@ class SignalGenerator:
         no_trade_zone_p = float(self._config.get("signal.no_trade_deadband", 0.02))
         mid_yes = (clob_state.yes_bid + clob_state.yes_ask) / 2.0
         if abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
+            logger.info(
+                "signal_abstain_no_trade_zone",
+                fair_prob=round(P_model, 4),
+                mid_yes=round(mid_yes, 4),
+                deadband=round(no_trade_zone_p, 4),
+                uncertainty_u=round(u_used, 4),
+            )
             return SignalResult(
                 signal="ABSTAIN",
                 abstain_reason="NO_TRADE_ZONE",

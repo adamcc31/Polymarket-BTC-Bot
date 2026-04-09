@@ -24,7 +24,6 @@ RUN mkdir -p logs
 
 # Set Environment Variables default (bisa di-override di Railway Dashboard)
 ENV PYTHONUNBUFFERED=1
-ENV TARGET_MARKET_SLUG="will-the-price-of-bitcoin-be-above-70000-on-april-7"
 
 # Perintah untuk menjalankan bot (engine baru; default dry-run)
 CMD ["python", "main.py", "--mode", "dry-run"]

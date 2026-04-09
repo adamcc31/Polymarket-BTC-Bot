@@ -18,6 +18,7 @@ import signal
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+import numpy as np
 
 import click
 import logging
@@ -67,7 +68,7 @@ else:
 from src.binance_feed import BinanceFeed
 from src.clob_feed import CLOBFeed
 from src.config_manager import ConfigManager
-from src.database import DatabaseManager
+
 from src.dry_run import DryRunEngine
 from src.execution import ExecutionClient
 from src.exporter import Exporter
@@ -107,7 +108,7 @@ class TradingBot:
 
         # Initialize components
         self._config = ConfigManager.get_instance()
-        self._db = DatabaseManager()
+
         self._binance = BinanceFeed(self._config)
         self._discovery = MarketDiscovery(self._config)
         self._clob = CLOBFeed(self._config)
@@ -182,6 +183,49 @@ class TradingBot:
                 pass
             await asyncio.sleep(interval_s)
 
+    async def _telegram_periodic_report_loop(self) -> None:
+        """Periodic 6-hour summary report and trades.csv dump."""
+        # 6 hours in seconds
+        interval_s = 6 * 3600.0
+        while self._running:
+            await asyncio.sleep(interval_s)
+            if not self._running:
+                break
+                
+            try:
+                metrics = self._dry_run.get_session_metrics()
+                summary = {
+                    "total_signals": metrics.total_signals_evaluated,
+                    "trades_executed": metrics.trades_executed,
+                    "win_rate": f"{metrics.win_rate*100:.1f}%" if metrics.win_rate is not None else "N/A",
+                    "pnl_usd": f"${metrics.total_pnl_usd:.2f}" if metrics.total_pnl_usd is not None else "N/A",
+                    "duration_hours": f"{metrics.duration_hours:.1f}" if metrics.duration_hours else "N/A",
+                }
+                
+                sum_text = self._tg_kv(summary)
+                
+                trades_path = None
+                if self._exporter:
+                    # Sync trades file
+                    self._exporter.export_trades(list(self._dry_run._trades.values()))
+                    trades_csv = self._exporter.session_dir / "trades.csv"
+                    if trades_csv.exists():
+                        trades_path = str(trades_csv)
+                        
+                if trades_path:
+                    try:
+                        await self._telegram.send_document(
+                            file_path=trades_path,
+                            caption=f"📈 <b>6-Hour Session Summary</b>\n\n{sum_text}",
+                        )
+                    except Exception as e:
+                        logger.error("telegram_report_failed", error=str(e))
+                else:
+                    await self._send_telegram("📈 6-Hour Session Summary", sum_text)
+                    
+            except Exception as e:
+                logger.error("periodic_report_loop_error", error=str(e))
+
     async def _dry_run_time_guard(self) -> None:
         """Stop after max duration unless live gate has already enabled live."""
         max_hours = float(self._config.get("dry_run.max_duration_hours", 48))
@@ -211,8 +255,7 @@ class TradingBot:
 
         self._running = True
 
-        # Initialize database
-        await self._db.init_db()
+
 
         # Load model
         if not self._model.load_latest():
@@ -273,6 +316,9 @@ class TradingBot:
             asyncio.create_task(
                 self._telegram_heartbeat_loop(), name="telegram_heartbeat"
             ),
+            asyncio.create_task(
+                self._telegram_periodic_report_loop(), name="telegram_periodic_report"
+            ),
         ]
 
         # Dry-run must finish within max duration (default 48h).
@@ -322,7 +368,7 @@ class TradingBot:
             f"pass_fail={metrics.pass_fail}",
         )
 
-        await self._db.close()
+
         self._config.stop()
         logger.info("bot_stopped", session=self._dry_run.session_id)
 
@@ -383,9 +429,33 @@ class TradingBot:
         q_fair = fair.q_fair
         uncertainty_u = fair.uncertainty_u
 
+        # ── Probability Source Selection (explicit policy) ────
+        prob_source = str(
+            self._config.get("signal.probability_source", "fair")
+        ).lower()
+        p_model = q_fair
+        if prob_source in ("ensemble", "hybrid"):
+            model_prob = self._model.predict(np.array(fv.values))
+            if prob_source == "ensemble":
+                p_model = model_prob
+            else:
+                # Hybrid: fair value remains anchor, model contributes directional prior.
+                fair_w = float(self._config.get("signal.hybrid_fair_weight", 0.7))
+                model_w = float(self._config.get("signal.hybrid_model_weight", 0.3))
+                total_w = max(1e-8, fair_w + model_w)
+                p_model = ((fair_w * q_fair) + (model_w * model_prob)) / total_w
+                p_model = max(0.0, min(1.0, p_model))
+            logger.info(
+                "probability_source_applied",
+                source=prob_source,
+                q_fair=round(q_fair, 4),
+                p_model=round(p_model, 4),
+                uncertainty_u=round(uncertainty_u, 4),
+            )
+
         # ── Signal Generation ─────────────────────────────────
         signal = self._signal_gen.evaluate(
-            q_fair, uncertainty_u, clob_state, market, fv
+            p_model, uncertainty_u, clob_state, market, fv
         )
         self._latest_signal = signal
         self._dry_run.record_signal(signal)
@@ -408,6 +478,7 @@ class TradingBot:
         # ── Execute Trade (Dry Run) ───────────────────────────
         if self._mode == "dry-run":
             trade = self._dry_run.simulate_trade(signal, approved, market)
+            self._discovery.mark_trade_executed()
 
             # Telegram: trade opened (paper order).
             asyncio.create_task(
@@ -471,6 +542,7 @@ class TradingBot:
                     entry_price_override=float(fill_price),
                     bet_size_override=float(effective_bet_size),
                 )
+                self._discovery.mark_trade_executed()
 
                 # Telegram: trade opened (shadow paper record for live).
                 asyncio.create_task(

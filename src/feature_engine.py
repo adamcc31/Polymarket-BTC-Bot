@@ -180,9 +180,33 @@ class FeatureEngine:
 
             compute_lag_ms = (time.time() - start_time) * 1000.0
 
-            # Determine TTR phase
-            ttr_min = self._config.get("signal.ttr_min_minutes", 5.0)
-            ttr_max = self._config.get("signal.ttr_max_minutes", 12.0)
+            # Determine TTR phase (supports dynamic policy by market horizon)
+            dyn_enabled = bool(self._config.get("signal.dynamic_ttr_enabled", True))
+            if dyn_enabled:
+                if lifespan_h <= 2.0:
+                    ttr_min = float(
+                        self._config.get("signal.entry_window_short_min_minutes", 5.0)
+                    )
+                    ttr_max = float(
+                        self._config.get("signal.entry_window_short_max_minutes", 45.0)
+                    )
+                elif lifespan_h <= 8.0:
+                    ttr_min = float(
+                        self._config.get("signal.entry_window_medium_min_minutes", 30.0)
+                    )
+                    ttr_max = float(
+                        self._config.get("signal.entry_window_medium_max_minutes", 240.0)
+                    )
+                else:
+                    ttr_min = float(
+                        self._config.get("signal.entry_window_long_min_minutes", 60.0)
+                    )
+                    ttr_max = float(
+                        self._config.get("signal.entry_window_long_max_minutes", 720.0)
+                    )
+            else:
+                ttr_min = float(self._config.get("signal.ttr_min_minutes", 5.0))
+                ttr_max = float(self._config.get("signal.ttr_max_minutes", 12.0))
             if ttr_minutes > ttr_max:
                 ttr_phase = "EARLY"
             elif ttr_minutes >= ttr_min:
