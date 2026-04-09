@@ -1,103 +1,96 @@
 # Polymarket BTC Trading Bot: Latency Arbitrage & Slow Skew Engine
 
-![Version](https://img.shields.io/badge/version-2.0.0--production-blue)
-![Python](https://img.shields.io/badge/python-3.11-green)
-![Status](https://img.shields.io/badge/status-active-success)
+![Version](https://img.shields.io/badge/version-2.0.0--serverless-blue)
+![Python](https://img.shields.io/badge/python-3.11%2B-green)
+![Architecture](https://img.shields.io/badge/architecture-No--DB%20%7C%20Flat%20Files-orange)
+![Status](https://img.shields.io/badge/status-production--ready-success)
 
-Dokumentasi teknis ini menyediakan gambaran mendalam tentang arsitektur, strategi, dan operasional bot trading otomatis yang dirancang khusus untuk mengeksploitasi inefisiensi latensi harga (*Slow Skew Arbitrage*) pada market prediksi Bitcoin (BTC) di Polymarket.
-
----
-
-## 1. Overview & Paradigma Strategi
-
-Proyek ini **BUKAN** bot peramal arah harga (directional trading/prediction), melainkan sistem **Arbitrase Latensi (Slow Skew Arbitrage)**.
-
-**Cara Kerja Edge Bot:**
-Alih-alih menebak apakah Bitcoin akan naik ke $72,000 dalam 4 jam ke depan, bot membandingkan **Spot Harga Binance Detik Ini** dengan **Harga Order Book Polymarket (CLOB)**. 
-Polymarket (CLOB) sering beroperasi lebih lambat merespons gejolak volatilitas spot dibandingkan Binance. Saat BTC melonjak tajam, rumus *Black-Scholes* di otak bot seketika mendeteksi *Fair Probability* yang baru. Jika harga tiket (shares) di Polymarket masih tertinggal (murah), bot akan langsung memborongnya sebelum *Market Maker* manusia/algoritmik Polymarket sempat mengkoreksinya.
-
-**Value Proposition Utama:**
-- **Deteksi Slow-Skew:** Menangkap *edge* saat Market Maker lambat merevisi probabilitas seiring dengan perubahan harga spot mendadak.
-- **Serverless & Lightweight:** Tanpa *Database* berat. Seluruh metrik diekspor via Flat Files (.CSV) dan dikirim seketika melalui Telegram.
-- **Resiliensi Railway Cloud:** Dirancang untuk berjalan 24/7 di VPS/Cloud dengan mekanisme fail-safe ketat terhadap putusnya websocket.
+Dokumentasi teknis ini merangkum arsitektur, filosofi strategi, dan panduan operasional dari bot trading otomatis Polymarket. Bot ini telah dirancang ulang sepenuhnya untuk menjadi sistem **Serverless & Stateless**, yang mengeksploitasi inefisiensi kecepatan (*Latency Arbitrage*) pada market biner Bitcoin.
 
 ---
 
-## 2. Arsitektur Sistem
+## 1. Filosofi Strategi: Deteksi "Slow Skew"
 
-Sistem direkayasa ulang menjadi sangat modular (Serverless-Oriented) berbasis event-driven menggunakan Python `asyncio`.
+Bot ini **BUKAN** bot peramal arah harga (Directional Trading) yang menebak apakah harga Bitcoin akan naik atau turun dalam 4 jam ke depan. Sebaliknya, bot ini beroperasi di bawah payung **Arbitrase Kecepatan (Latency/Micro-Mispricing Arbitrage)**.
 
-1.  **Data Ingestion Layer:**
-    *   **Binance Feed:** Sinkronisasi harga BTC secara real-time via WebSocket berkecepatan tinggi.
-    *   **CLOB Feed:** Polling snapshot Order Book dari Polymarket Clob-API.
-2.  **Engine Keputusan (The Engine):**
-    *   **FairProbabilityEngine:** Menghasilkan `q_fair = P(S_T >= K)` secara instan memakai model *digital-option* (Black-Scholes).
-    *   **SignalGenerator:** Mencari ketimpangan antara `q_fair` dan `clob_ask` Polymarket. Akan memutuskan `BUY_YES` / `BUY_NO` / `ABSTAIN`.
-3.  **Reporter & Observabilitas:**
-    *   **Exporter:** Setiap *slice* dari transaksi akan dicatat dalam rentetan `trades.csv`.
-    *   **Telegram Notifier:** Setiap 6 jam, bot bangun mengkomputasi laba bersih (PnL) & Win-rate, kemudian **mengirim `trades.csv` secara otomatis** ke Telegram grup/channel milik Anda.
+### Mekanisme Keuntungan (The Alpha):
+1. **The Anchor (Binance):** Harga Spot Binance bereaksi dalam hitungan milidetik (*ultra-low latency*).
+2. **The Lag (Polymarket CLOB):** Market Maker (algoritma penyedia likuiditas) di Polymarket sering kali membutuhkan waktu 30-60 detik untuk memperbarui harga order book (CLOB) setelah terjadi pergerakan ekstrem di Binance.
+3. **The Math (Fair Probability):** Setiap detik, bot mengkonversi harga Binance Spot menjadi *Probabilitas Objektif* menggunakan model **Black-Scholes Digital Option**.
+4. **The Execution:** Jika Binance melonjak drastis dan peluang *Fair* sebuah token YES adalah 48% ($0.48), tetapi Polymarket masih tertinggal dan menjual token tersebut seharga 30% ($0.30), bot akan secara instan memborong token tersebut.
 
-*(Catatan: Proyek ini TIDAK LAGI menggunakan SQLite atau PostgreSQL untuk memudahkan deployment cloud yang efisien).*
+Keuntungan didapatkan dari "kesenjangan respons pasar" (Slow Skew), bukan dari prediksi masa depan murni.
 
 ---
 
-## 3. Market Discovery Engine (Automatisasi Rotasi)
+## 2. Arsitektur Sistem (Serverless & Lightweight)
 
-Anda tidak perlu menyuapi bot dengan ID market secara manual.
-Modul `market_discovery.py` memastikan bot otomatis rotasi dan mengunci ke market ter-likuid (`active_market`):
+Pemutakhiran arsitektur besar-besaran telah dilakukan agar bot ideal untuk *deployment Cloud (Railway/VPS)* dengan intervensi nol.
 
-- **Auto-Search:** Memindai sub-market yang berkaitan dengan struktur: "Will BTC be above $X on [Date]".
-- **Auto-Rotate:** Jika satu market selesai resolusi atau mendekati saat *closing time*, bot langsung mencari event 1-12 jam berikutnya tanpa perlu di-*restart*.
-- **Vig Safety Filter:** Bot menolak masuk ke sub-market jika biaya spread (Vig) mencapai margin mematikan (default disetel aman di 7%).
-
----
-
-## 4. Peluang Kemenangan & Manajemen Risiko
-
-Setiap trade harus melewati **Circuit Breaker** ketat:
-
-- **Margin of Safety:** Tidak akan masuk ke market bila ketimpangan *Fair Prob* versus *Polymarket Price* (Edge) kurang dari batas persentase krusial.
-- **Liquidity Reject:** Jika Market Maker Polymarket sengaja melebarkan selisih Bid-Ask (>7%), bot mendeteksi bahaya dan `LIQUIDITY_BLOCK` (Abstain).
-- **Dry-Run Live Gate:** *Sistem tidak merelakan uang sungguhan hingga simulasi Dry-Run minimal telah melewati 10 trade simulasi dengan Win-Rate positif*.
+- **Non-Database (No-DB):** Proyek ini **100% bebas dari Database** (Tidak ada SQLite, tidak ada PostgreSQL). Semua data persisten diubah menjadi sistem *Flat-File CSV* memori rendah.
+- **Dynamic Market Discovery:** Bot tidak bergantung pada satu URL/Slug market mati. Modul `market_discovery.py` akan otomatis menyapu seluruh API Polymarket, menemukan market BTC biner yang likuid, mengunci durasi (1-12 jam), mengeksekusi, dan otomatis berputar (*rotate*) ke market baru ketika market lama kedaluwarsa.
+- **Asynchronous Execution:** Menggunakan `asyncio` untuk `BinanceFeed` (WebSocket) dan `CLOBFeed` (API Polling HTTPX) berjalan paralel dalam skala milidetik.
 
 ---
 
-## 5. Deployment Serverless & Telemetry (Railway)
+## 3. Alur Kerja (Lifecycle)
 
-Dirancang murni untuk *Dockerized Runtime* (mis: Railway.app):
+1. **Market Scanning:** Bot secara otomatis mendeteksi market "Bitcoin Price Action" di Polymarket dengan likuiditas minimum dan *spread* wajar ($>10 USD depth, <7% vig).
+2. **Real-time Synchronization:** Menarik data WebSocket Binance dan *Order Book* Polymarket secara terus-menerus.
+3. **Mispricing Calculation:** `FairProbabilityEngine` membandingkan probabilitas matematis dari Spot saat ini terhadap harga riil `ask/bid` CLOB.
+4. **Signal & Risk Gate:** Saat deteksi *mispricing* melebihi ambang batas *safety margin* (>5%), `signal_generator.py` menerbitkan sinyal `BUY_YES` atau `BUY_NO`.
+5. **Execution (Dry-Run / Live):** Bot mendaftarkan trade secara simulasi (Dry-Run) atau mengeksekusinya di relayer *on-chain* Polymarket secara tanpa gas (*gasless via Polygon*).
 
-### Konfigurasi `.env` Wajib
-```env
-# Credentials Opsional API
-BINANCE_API_KEY=xxx
-BINANCE_API_SECRET=xxx
+---
 
-# Polygon Private Key untuk tanda tangan eksekusi L2 (Polymarket)
-POLYMARKET_PRIVATE_KEY=0x...
+## 4. Observabilitas & Notifikasi Telegram (6-Hour Loop)
 
-# Konfigurasi Telegram (Wajib agar CSV dikirim otomatis tiap 6 jam)
-TELEGRAM_BOT_TOKEN=xxx
-TELEGRAM_CHAT_ID=xxx
+Karena bot beroperasi 24/7 di *background* VPS (Serverless / Docker), sistem pemantauan dialihkan secara penuh ke ekspor CSV dan notifikasi Telegram.
+
+1. **Exporter CSV (`src/exporter.py`):**
+   - Setiap keputusan, sesi, dan rekaman CLOB (`clob_log.csv`) serta Trades (`trades.csv`) disimpan ke `data/exports/<session_id>/`.
+   
+2. **Telegram 6-Hour Automated Reporter:**
+   - Bot memiliki skema pengulangan otomatis (Tiap 6 Jam / `21600 detik`).
+   - Merangkum metrik (`Win Rate`, `PnL`, Porsi *Signals*, Total Trade).
+   - **Sinkronisasi File:** Setiap 6 jam, bot tidak hanya mengirim teks pesan, tetapi **secara fisik mengunggah dan mengirim file `trades.csv`** terbaru langsung ke Telegram Anda. Ini memastikan *review* performa bisa dilakukan dari ponsel tanpa mengakses server.
+
+---
+
+## 5. Deployment Guide (Railway / Docker VPS)
+
+Sistem telah di-*containerize* standar lewat `.env` dan `Dockerfile` minimal.
+
+### Environment Variables Wajib (`.env`)
+```ini
+POLYMARKET_PRIVATE_KEY=0x... (Wallet Polygon)
+BINANCE_API_KEY=...
+BINANCE_API_SECRET=...
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
 ```
 
-### Script Eksekusi Server
+### Build & Run
+Bot dikonfigurasi melalui `railway.toml` untuk menjamin otomatisasi.
+
+**Local / Manual Docker:**
 ```bash
-# Instalasi (termasuk Polars ringan, httpx, & pydantic)
+# Instalasi Lightweight
 pip install -r requirements.txt
 
-# Menjalankan bot (mode Dry Run, Default)
+# Eksekusi Opserver Dry-Run Mode
 python main.py --mode dry-run
-
-# Mode Live Eksekusi
-python main.py --mode live --confirm-live
 ```
 
----
-
-## 6. Riset Masa Depan (The 13 Million Ticks Edge)
-
-Di dalam repositori ini terdapat dataset emas **`dataset/btc_5m_hf_ticks.parquet`** yang berisi ~13,300,000 baris rekam jejak latensi nyata Polymarket (resolusi 100ms).
-Penyempurnaan masa depan akan difokuskan untuk menyesuaikan formula *Spread Buffer* secara mutlak memanfaatkan data High-Frequency Ticks ini, memantapkan seberapa banyak milidetik tepatnya *Market Maker* Polymarket bisa dikalahkan.
+**Aturan `max_market_vig`:** Batasan toleransi ketebalan (*spread width*) standar diset ke **0.07 (7%)**. Angka empiris market riil Polymarket adalah ~0.1%. Batasan 7% hanya digunakan sebagai *Circuit Breaker* seandainya API market membanderol harga error. 
 
 ---
-*Dibuat dengan presisi oleh Senior Quant Engineering Team.*
+
+## 6. Pengembangan Masa Depan (Riset HF Ticks)
+
+Bukti pendukung *Latency Arbitrage* kini disematkan di folder dataset HF (`dataset/btc_5m_hf_ticks.parquet` berisi ~13,3 Juta baris).
+
+Langkah riset optimasi berikutnya adalah merancang sistem uji balikan (*backtest*) murni yang dapat mensimulasikan order dari *tick* historis guna mendeteksi jarak keterlambatan spesifik (milidetik) optimal yang menghubungkan lonjakan WebSocket Binance dan resync API Polymarket.
+
+---
+*Arsitektur & Konsep diperbarui: April 2026. Dioptimalkan untuk "High-Frequency Dry Run" Server Deployment.*
