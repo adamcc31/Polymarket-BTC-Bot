@@ -193,7 +193,7 @@ class TradingBot:
                 break
                 
             try:
-                metrics = self._dry_run.get_session_metrics()
+                metrics = self._dry_run.compute_session_metrics(self._model.version)
                 summary = {
                     "total_signals": metrics.total_signals_evaluated,
                     "trades_executed": metrics.trades_executed,
@@ -318,6 +318,9 @@ class TradingBot:
             ),
             asyncio.create_task(
                 self._telegram_periodic_report_loop(), name="telegram_periodic_report"
+            ),
+            asyncio.create_task(
+                self._ultrashort_market_loop(), name="ultrashort_loop"
             ),
         ]
 
@@ -680,6 +683,42 @@ class TradingBot:
                 ),
                 name="tg_go_live_enabled",
             )
+
+    # ── Ultra-Short Market Evaluation Loop ─────────────────────
+
+    async def _ultrashort_market_loop(self) -> None:
+        """30-second evaluation loop for markets ≤ 10 minutes.
+
+        Standard 15-min bar close is too slow for 5-minute markets.
+        This injects a synthetic bar every 30 seconds to trigger the
+        full signal pipeline at a cadence matching ultra-short horizons.
+        """
+        while self._running:
+            await asyncio.sleep(30)
+
+            if not self._discovery.is_market_active:
+                continue
+
+            market = self._discovery.active_market
+            if market is None:
+                continue
+
+            lifespan_seconds = (market.T_resolution - market.T_open).total_seconds()
+            if lifespan_seconds > 600:  # Only for ≤ 10 minute markets
+                continue
+
+            btc_price = self._binance.latest_price
+            if btc_price is None:
+                continue
+
+            synthetic_bar = {
+                "close": btc_price,
+                "is_synthetic": True,
+            }
+            try:
+                await self._on_bar_close(synthetic_bar)
+            except Exception as e:
+                logger.error("ultrashort_loop_error", error=str(e))
 
     # ── CLOB Polling Loop ─────────────────────────────────────
 

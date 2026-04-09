@@ -52,8 +52,8 @@ class FairProbabilityEngine:
         self._q_clip = float(self._config.get("fair_prob.q_clip", 1e-6))
 
         # Uncertainty buffer (probability points)
-        self._base_u = float(self._config.get("fair_prob.base_uncertainty_p", 0.06))
-        self._near_expiry_u_boost = float(self._config.get("fair_prob.near_expiry_u_boost", 0.25))
+        self._base_u = float(self._config.get("fair_prob.base_uncertainty_p", 0.03))
+        self._near_expiry_u_boost = float(self._config.get("fair_prob.near_expiry_u_boost", 0.10))
         self._min_u = float(self._config.get("fair_prob.min_uncertainty_p", 0.01))
         self._max_u = float(self._config.get("fair_prob.max_uncertainty_p", 0.25))
 
@@ -106,8 +106,20 @@ class FairProbabilityEngine:
 
         # Vol floor: inflate near expiry (digital option sensitivity is high).
         tau_min = tau_seconds / 60.0
+
+        # Detect ultra-short market: if total lifespan ≤ 10 minutes,
+        # disable near-expiry bias to avoid over-penalization.
+        market_lifespan_min = max(
+            1.0,
+            (active_market.T_resolution - active_market.T_open).total_seconds() / 60.0
+        )
+        is_ultrashort = market_lifespan_min <= 10.0
+
         # Near-expiry weight in [0,1] (0 when far, 1 when <= 5 minutes).
-        near_w = max(0.0, min(1.0, (5.0 - tau_min) / 5.0))
+        if is_ultrashort:
+            near_w = 0.0
+        else:
+            near_w = max(0.0, min(1.0, (5.0 - tau_min) / 5.0))
         sigma_floor = self._sigma_floor_ann * (1.0 + self._sigma_floor_boost_near_expiry * near_w)
         sigma_used_ann = max(sigma_ann, sigma_floor)
 

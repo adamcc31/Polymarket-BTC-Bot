@@ -80,29 +80,32 @@
   "market_discovery": {
     "poll_interval_s": 30,
     "waiting_poll_s": 60,
-    "min_ttr_to_discover": 5.0,
-    "late_ttr_minutes": 3.0,
-    "rotation_ttr_buffer_minutes": 5.0,
+    "min_ttr_to_discover": 2.0,
+    "late_ttr_minutes": 0.5,
+    "rotation_ttr_buffer_minutes": 2.0,
     "tag_slug": "bitcoin",
-    "min_volume_24hr": 1000.0,
+    "min_volume_24hr": 50000.0,
     "strike_distance_soft_cap_pct": 0.2,
     "strike_distance_hard_cap_pct": 0.5,
     "hard_penalty_absurd_strike": 0.3,
+    "target_ttr_minutes": 5.0,
     "target_horizons_minutes": [
-      120.0,
-      240.0,
-      480.0
+      5.0
     ],
-    "weight_volume": 0.25,
-    "weight_prob": 0.2,
-    "weight_ttr": 0.15,
-    "weight_strike": 0.25,
-    "weight_horizon": 0.15
+    "weight_volume": 0.40,
+    "weight_prob": 0.25,
+    "weight_ttr": 0.20,
+    "weight_strike": 0.10,
+    "weight_horizon": 0.05
   },
   "rotation": {
-    "min_dwell_minutes": 20.0,
+    "min_dwell_minutes": 3.0,
     "freeze_when_in_entry_window": true,
-    "cooldown_after_trade_minutes": 10.0
+    "cooldown_after_trade_minutes": 2.0
+  },
+  "fair_prob": {
+    "base_uncertainty_p": 0.03,
+    "near_expiry_u_boost": 0.10
   },
   "telegram": {
     "enabled": true,

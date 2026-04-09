@@ -58,7 +58,9 @@ class MarketDiscovery:
         r"btc.*reach.*\$",
         r"bitcoin.*dip.*\$",
         r"btc.*dip.*\$",
-        r"what\s+price\s+will\s+bitcoin\s+hit",
+        r"btc.*5.*minute.*up.*or.*down",
+        r"bitcoin.*5.*min",
+        r"btc.*5min",
     ]
 
     # Strike price extraction patterns
@@ -84,7 +86,7 @@ class MarketDiscovery:
         self._candidate_pool_size = config.get("market_discovery.candidate_pool_size", 5)
         self._rotation_score_buffer = config.get("market_discovery.rotation_score_buffer", 0.03)
         self._target_yes_prob = config.get("market_discovery.target_yes_probability", 0.5)
-        self._target_ttr_minutes = config.get("market_discovery.target_ttr_minutes", 120.0)
+        self._target_ttr_minutes = config.get("market_discovery.target_ttr_minutes", 5.0)
         self._running = False
         self._last_log_time: float = 0.0
         self._candidate_pool: list[dict[str, Any]] = []
@@ -708,6 +710,17 @@ class MarketDiscovery:
             0.0,
             (market.T_resolution - market.T_open).total_seconds() / 3600.0,
         )
+        lifespan_min = lifespan_h * 60.0
+
+        # Ultra-short market (≤ 10 minutes lifespan)
+        if lifespan_min <= 10.0:
+            entry_open_pct = float(self._config.get("signal.ultrashort_entry_open_pct", 0.80))
+            entry_close_pct = float(self._config.get("signal.ultrashort_entry_close_pct", 0.10))
+            return (
+                lifespan_min * entry_close_pct,
+                lifespan_min * entry_open_pct,
+            )
+
         if lifespan_h <= 2.0:
             return (
                 float(self._config.get("signal.entry_window_short_min_minutes", 5.0)),

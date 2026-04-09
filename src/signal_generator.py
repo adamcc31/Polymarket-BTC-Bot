@@ -56,6 +56,17 @@ class SignalGenerator:
             0.0,
             (active_market.T_resolution - active_market.T_open).total_seconds() / 3600.0,
         )
+        lifespan_min = lifespan_h * 60.0
+
+        # Ultra-short market (≤ 10 minutes lifespan)
+        if lifespan_min <= 10.0:
+            entry_open_pct = float(self._config.get("signal.ultrashort_entry_open_pct", 0.80))
+            entry_close_pct = float(self._config.get("signal.ultrashort_entry_close_pct", 0.10))
+            return (
+                lifespan_min * entry_close_pct,
+                lifespan_min * entry_open_pct,
+            )
+
         if lifespan_h <= 2.0:
             return (
                 float(self._config.get("signal.entry_window_short_min_minutes", 5.0)),
