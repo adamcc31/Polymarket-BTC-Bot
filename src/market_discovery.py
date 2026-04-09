@@ -142,19 +142,22 @@ class MarketDiscovery:
         seconds_to_epoch = (5 * 60) - seconds_past
 
         # 1. Active Transition Window latency mitigation (0 to 3 seconds past epoch)
-        # Pull data aggressively with 500ms intervals!
         if seconds_past < 3.0:
             await asyncio.sleep(0.5)
             return
 
-        # 2. Precision Timer
-        # If the next epoch hits before our normal sleep ends, sleep EXACTLY until the epoch!
+        # 2. VATIC PRE-FETCH WINDOW (Wake up EXACTLY at T-30s)
+        # Jika waktu menuju epoch lebih dari 30s, dan sisa waktunya menuju T-30s lebih kecil dari interval normal
+        if seconds_to_epoch > 30.0 and (seconds_to_epoch - 30.0) <= base_interval:
+            await asyncio.sleep((seconds_to_epoch - 30.0) + 0.05)
+            return
+
+        # 3. Precision Timer for exactly T-0
         if seconds_to_epoch <= base_interval:
-            # Wake up 50ms after the epoch rolls over
             await asyncio.sleep(seconds_to_epoch + 0.05)
             return
 
-        # 3. Default Polling
+        # 4. Default Polling
         await asyncio.sleep(base_interval)
 
     async def _handle_searching(self) -> None:
@@ -172,8 +175,14 @@ class MarketDiscovery:
                 resolution_source=market.resolution_source,
             )
         else:
-            self._state = DiscoveryState.WAITING
-            logger.info("no_active_market_found", transitioning_to="WAITING")
+            # Cegah transisi ke WAITING jika kita menjalankan strategi 5m dynamic
+            has_dynamic_targets = bool(self._config.get("market_discovery.dynamic_5m_event_slugs", []))
+            if has_dynamic_targets:
+                # Tetap di SEARCHING mode, stalking oracle price
+                logger.debug("dynamic_market_stalking", msg="Staying in SEARCHING state to monitor Oracle")
+            else:
+                self._state = DiscoveryState.WAITING
+                logger.info("no_active_market_found", transitioning_to="WAITING")
         await self._sleep_epoch_synchronized(self._poll_interval)
 
     async def _handle_active(self) -> None:
