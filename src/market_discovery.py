@@ -473,7 +473,7 @@ class MarketDiscovery:
                                 m_patched["startDate"] = iso_open
                                 m_patched["createdAt"] = iso_open
     
-                            parsed = self._parse_market(m_patched)
+                            parsed = self._parse_market(m_patched, fallback_strike=spot_price)
                             if parsed is None:
                                 logger.info(
                                     "dynamic_5m_parse_returned_none",
@@ -588,7 +588,7 @@ class MarketDiscovery:
                             skipped_reasons.append(f"Low-Volume: '${volume:,.0f}' for '{q[:50]}...'")
                         continue
 
-                    parsed = self._parse_market(m)
+                    parsed = self._parse_market(m, fallback_strike=spot_price)
                     if not parsed:
                         if len(skipped_reasons) < 5 and ("bitcoin" in q.lower() or "btc" in q.lower()):
                             skipped_reasons.append(f"ParseFailed: '{q[:50]}...'")
@@ -666,7 +666,7 @@ class MarketDiscovery:
             for pattern in self.MARKET_PATTERNS
         )
 
-    def _parse_market(self, market_data: dict) -> Optional[ActiveMarket]:
+    def _parse_market(self, market_data: dict, fallback_strike: Optional[float] = None) -> Optional[ActiveMarket]:
         """
         Parse market JSON into ActiveMarket schema.
         CRITICAL: Strike price extracted from question text / metadata.
@@ -754,8 +754,13 @@ class MarketDiscovery:
             if strike_price is None:
                 question_l = question.lower()
                 if is_dynamic_5m:
-                    # Not an unsupported market, just waiting for the API to lock the price!
-                    logger.info("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
+                    if fallback_strike and fallback_strike > 1000.0:
+                        strike_price = fallback_strike
+                        logger.info("dynamic_strike_using_spot_fallback", 
+                                    market_id=market_id, strike=strike_price)
+                    else:
+                        # Not an unsupported market, just waiting for the API to lock the price!
+                        logger.info("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
                 elif "up or down" in question_l and "from $" not in question_l:
                     logger.info(
                         "unsupported_market_type_no_strike",
@@ -769,6 +774,8 @@ class MarketDiscovery:
                         market_id=market_id,
                         question=question,
                     )
+
+            if strike_price is None:
                 return None
 
             # Extract CLOB token IDs
