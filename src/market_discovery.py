@@ -181,6 +181,10 @@ class MarketDiscovery:
             self._state = DiscoveryState.SEARCHING
             return
 
+        # --- Strike Upgrade Checker ---
+        # If we are using a synthetic Binance spot fallback, keep polling for oracle update.
+        await self._refresh_strike_if_synthetic()
+
         now = datetime.now(timezone.utc)
         ttr_seconds = (self._active_market.T_resolution - now).total_seconds()
         ttr_minutes = ttr_seconds / 60.0
@@ -211,6 +215,49 @@ class MarketDiscovery:
             )
 
         await self._sleep_epoch_synchronized(self._poll_interval)
+
+    async def _refresh_strike_if_synthetic(self) -> None:
+        """
+        Jika strike masih berupa spot fallback, coba ambil groupItemThreshold 
+        dari API. Jika sudah tersedia, upgrade ke nilai resmi.
+        """
+        if not self._active_market:
+            return
+            
+        # Hanya relevan untuk 5m dynamic markets (atau format sejenis tanpa strike di judul)
+        question = self._active_market.question.lower()
+        if "up or down" not in question:
+            return
+            
+        try:
+            # Kita gunakan httpx client singkat untuk pengecekan cepat
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # Gamma API /markets/{id} mengembalikan data detail market individual
+                resp = await client.get(
+                    f"{self.GAMMA_API_BASE}/markets/{self._active_market.market_id}"
+                )
+                if not resp.is_success:
+                    return
+                
+                data = resp.json()
+                # Cek jika oracle sudah mengisi threshold resmi
+                raw = data.get("groupItemThreshold") or data.get("initial_price") or data.get("strike_price")
+                
+                if raw:
+                    real_strike = float(raw)
+                    # Jika real_strike berbeda signifikan atau nilai lama kita hanyalah estimasi
+                    if real_strike > 1000.0 and abs(real_strike - self._active_market.strike_price) > 0.0001:
+                        self._active_market = self._active_market.model_copy(
+                            update={"strike_price": real_strike}
+                        )
+                        logger.info(
+                            "dynamic_strike_upgraded_from_oracle",
+                            market_id=self._active_market.market_id,
+                            strike=real_strike
+                        )
+        except Exception:
+            # Gagal polling strike? diam saja (silently fail) agar loop utama tetap jalan
+            pass
 
     async def _handle_waiting(self) -> None:
         """Wait mode — poll less frequently."""
