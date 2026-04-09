@@ -17,7 +17,7 @@ import asyncio
 import json
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional, Literal, Any
 
@@ -373,15 +373,153 @@ class MarketDiscovery:
         )
         return best["market"]
 
+    # ── Dynamic 5-Minute Market Discovery ────────────────────────
+
+    async def _query_dynamic_5m_markets(self, spot_price: Optional[float]) -> list[dict]:
+        """
+        Targeted discovery for dynamic short-interval markets (e.g. BTC Up/Down 5-min).
+
+        WHY THIS EXISTS:
+        - Dynamic 5-min markets have only ~5 min of lifespan, so they NEVER accumulate
+          enough volume24hr to rank in a generic volume-sorted scan (top-200).
+        - The Gamma /markets?order=volume24hr endpoint will never surface them.
+        - Fix: query the known parent event by slug via /events, then extract the
+          currently active sub-market directly.
+
+        ALSO FIXES:
+        - `startDateIso` on sub-markets is the *event* creation date (days ago),
+          not the current 5-min window open time.  We synthesize a correct T_open
+          as T_resolution − 5 min so that the lifespan check in _parse_market passes.
+        """
+        event_slugs: list[str] = self._config.get(
+            "market_discovery.dynamic_5m_event_slugs",
+            ["btc-updown-5m"],
+        )
+        candidates: list[dict] = []
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for slug in event_slugs:
+                try:
+                    resp = await client.get(
+                        f"{self.GAMMA_API_BASE}/events",
+                        params={"slug": slug, "limit": 1},
+                    )
+                    resp.raise_for_status()
+                    payload = resp.json()
+
+                    # Gamma may return a list or {"data": [...]}
+                    if isinstance(payload, dict):
+                        payload = payload.get("data", [payload])
+                    if not isinstance(payload, list) or not payload:
+                        logger.warning("dynamic_5m_event_not_found", slug=slug)
+                        continue
+
+                    event = payload[0]
+                    sub_markets: list[dict] = event.get("markets", [])
+
+                    if not sub_markets:
+                        logger.warning("dynamic_5m_event_has_no_markets", slug=slug,
+                                       event_id=event.get("id"))
+                        continue
+
+                    for m in sub_markets:
+                        # Basic activity check
+                        if not m.get("active") or m.get("closed"):
+                            continue
+                        if not m.get("enableOrderBook"):
+                            continue
+
+                        # --- Patch T_open: use T_resolution − 5 min ---
+                        # The event-level startDate is the series creation date,
+                        # NOT the current 5-min window open time. Fix it here so
+                        # _parse_market's lifespan check does not reject the market.
+                        end_date_str = (
+                            m.get("end_date_iso") or m.get("endDateIso") or m.get("endDate", "")
+                        )
+                        T_res = self._parse_timestamp(end_date_str)
+                        m_patched = dict(m)
+                        if T_res is not None:
+                            synthetic_open = T_res - timedelta(minutes=5)
+                            iso_open = synthetic_open.isoformat()
+                            # Overwrite all possible startDate field names
+                            m_patched["startDateIso"] = iso_open
+                            m_patched["startDate"] = iso_open
+                            m_patched["createdAt"] = iso_open
+
+                        parsed = self._parse_market(m_patched)
+                        if parsed is None:
+                            logger.info(
+                                "dynamic_5m_parse_returned_none",
+                                slug=slug,
+                                market_id=m.get("conditionId") or m.get("id"),
+                                question=m.get("question", "")[:80],
+                            )
+                            continue
+
+                        if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                            logger.info(
+                                "dynamic_5m_missing_token_ids",
+                                market_id=parsed.market_id,
+                                question=parsed.question[:80],
+                            )
+                            continue
+
+                        # 5-min markets have negligible 24hr volume by design;
+                        # use total volume (all-time) as the liquidity signal instead.
+                        volume = float(
+                            m.get("volume") or m.get("volumeNum", 0.0) or
+                            m.get("volume24hr", 0.0) or 0.0
+                        )
+                        yes_prob = self._extract_yes_probability(m)
+                        score_components = self._score_candidate(
+                            market=parsed,
+                            volume_24h=volume,
+                            yes_prob=yes_prob,
+                            spot_price=spot_price,
+                        )
+                        candidates.append(
+                            {
+                                "market": parsed,
+                                "volume": volume,
+                                "yes_prob": yes_prob,
+                                "score": score_components["score_total"],
+                                "score_components": score_components,
+                                "source": f"event:{slug}",
+                            }
+                        )
+                        logger.info(
+                            "dynamic_5m_candidate_found",
+                            market_id=parsed.market_id,
+                            question=parsed.question[:80],
+                            TTR_minutes=round(parsed.TTR_minutes, 2),
+                            strike_price=parsed.strike_price,
+                            yes_prob=yes_prob,
+                            slug=slug,
+                        )
+
+                except httpx.HTTPError as e:
+                    logger.warning("dynamic_5m_event_http_error", slug=slug, error=str(e))
+                except Exception as e:
+                    logger.warning("dynamic_5m_event_parse_error", slug=slug, error=str(e))
+
+        return candidates
+
     async def _query_candidates(self) -> list[dict]:
         """
         Query Gamma API via /markets endpoint for active price-action targets.
         Uses a high limit (200) to find daily markets even if buried in volume.
+
+        ALSO merges results from _query_dynamic_5m_markets() — a targeted event-based
+        lookup for short-interval markets that never surface via volume-sorted scans.
         """
         min_volume = self._config.get("market_discovery.min_volume_24hr", 1000.0)
         spot_price = await self._fetch_binance_spot()
 
         try:
+            # ── Path A: targeted event-based lookup for 5-min dynamic markets ──
+            dynamic_candidates = await self._query_dynamic_5m_markets(spot_price)
+
+            # ── Path B: generic volume-sorted scan for daily/hourly markets ──
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.get(
                     f"{self.GAMMA_API_BASE}/markets",
@@ -399,78 +537,87 @@ class MarketDiscovery:
                 if not isinstance(markets, list):
                     markets = markets.get("data", []) if isinstance(markets, dict) else []
 
-                candidates = []
-                skipped_reasons = [] # Log top 5 skipped for transparency
+                candidates = list(dynamic_candidates)  # seed with dynamic results
+                seen_ids = {c["market"].market_id for c in candidates}
+                skipped_reasons = []  # Log top 5 skipped for transparency
 
                 for m in markets:
                     q = m.get("question", "")
-                    
+
                     # 1. Basic Technical Filter
                     if not m.get("active") or m.get("closed") or not m.get("enableOrderBook"):
                         continue
-                            
+
                     # 2. Design Pattern Check (Strict Above/Up/Down)
                     if not self._is_btc_up_down_market(m):
                         if len(skipped_reasons) < 5 and ("bitcoin" in q.lower() or "btc" in q.lower()):
                             skipped_reasons.append(f"PA-Mismatch: '{q[:50]}...'")
                         continue
-                            
-                    # 3. Volume Check
+
+                    # 3. Volume Check — skip for 5-min dynamic markets (handled in Path A)
                     volume = float(m.get("volume24hr", 0.0) or m.get("volume", 0.0) or 0.0)
-                    if volume < min_volume:
+                    is_dynamic = "up or down - 5 minute" in q.lower() or "up or down - 5 min" in q.lower()
+                    if not is_dynamic and volume < min_volume:
                         if len(skipped_reasons) < 5:
                             skipped_reasons.append(f"Low-Volume: '${volume:,.0f}' for '{q[:50]}...'")
                         continue
 
                     parsed = self._parse_market(m)
-                    if parsed:
-                        # Bypass strict TTR minimum for 5-minute dynamic markets
-                        is_5m_target = "5 minute" in parsed.question.lower()
-                        
-                        if is_5m_target or parsed.TTR_minutes >= self._min_ttr:
-                            # Ensure CLOB tradability: must have YES/NO token IDs.
-                            if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
-                                if len(skipped_reasons) < 5:
-                                    skipped_reasons.append(
-                                        f"Missing-Token-IDs: '{q[:50]}...'"
-                                    )
-                                continue
+                    if not parsed:
+                        if len(skipped_reasons) < 5 and ("bitcoin" in q.lower() or "btc" in q.lower()):
+                            skipped_reasons.append(f"ParseFailed: '{q[:50]}...'")
+                        continue
 
-                        # Basis-risk policy: only hard-skip if explicitly configured.
-                        non_binance_policy = self._config.get(
-                            "settlement.non_binance_policy", "uncertainty_inflate"
-                        )
-                        non_binance_is_mismatch = not (
-                            parsed.settlement_exchange == "BINANCE"
-                            and parsed.settlement_granularity == "1m"
-                        )
-                        if (
-                            non_binance_policy == "abstain"
-                            and non_binance_is_mismatch
-                        ):
+                    # Deduplicate against dynamic results
+                    if parsed.market_id in seen_ids:
+                        continue
+                    seen_ids.add(parsed.market_id)
+
+                    # Bypass strict TTR minimum for 5-minute dynamic markets
+                    is_5m_target = "5 minute" in parsed.question.lower()
+                    if is_5m_target or parsed.TTR_minutes >= self._min_ttr:
+                        # Ensure CLOB tradability: must have YES/NO token IDs.
+                        if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                            if len(skipped_reasons) < 5:
+                                skipped_reasons.append(f"Missing-Token-IDs: '{q[:50]}...'")
                             continue
 
-                        yes_prob = self._extract_yes_probability(m)
-                        score_components = self._score_candidate(
-                            market=parsed,
-                            volume_24h=volume,
-                            yes_prob=yes_prob,
-                            spot_price=spot_price,
-                        )
-                        candidates.append(
-                            {
-                                "market": parsed,
-                                "volume": volume,
-                                "yes_prob": yes_prob,
-                                "score": score_components["score_total"],
-                                "score_components": score_components,
-                            }
-                        )
+                    # Basis-risk policy: only hard-skip if explicitly configured.
+                    non_binance_policy = self._config.get(
+                        "settlement.non_binance_policy", "uncertainty_inflate"
+                    )
+                    non_binance_is_mismatch = not (
+                        parsed.settlement_exchange == "BINANCE"
+                        and parsed.settlement_granularity == "1m"
+                    )
+                    if non_binance_policy == "abstain" and non_binance_is_mismatch:
+                        continue
+
+                    yes_prob = self._extract_yes_probability(m)
+                    score_components = self._score_candidate(
+                        market=parsed,
+                        volume_24h=volume,
+                        yes_prob=yes_prob,
+                        spot_price=spot_price,
+                    )
+                    candidates.append(
+                        {
+                            "market": parsed,
+                            "volume": volume,
+                            "yes_prob": yes_prob,
+                            "score": score_components["score_total"],
+                            "score_components": score_components,
+                            "source": "volume_scan",
+                        }
+                    )
 
                 if not candidates and skipped_reasons:
-                    logger.info("discovery_skipped_candidates", 
-                                top_reasons=skipped_reasons,
-                                total_markets_scanned=len(markets))
+                    logger.info(
+                        "discovery_skipped_candidates",
+                        top_reasons=skipped_reasons,
+                        total_markets_scanned=len(markets),
+                        dynamic_candidates_found=len(dynamic_candidates),
+                    )
 
                 candidates.sort(key=lambda c: c["score"], reverse=True)
                 return candidates
@@ -510,9 +657,13 @@ class MarketDiscovery:
             # ----------------------------------------------------
             # DYNAMIC 5-MIN DETECTION
             # ----------------------------------------------------
+            # Be permissive: catch any variant of "up or down" with "5 min"
+            # in either the question or groupItemTitle field.
+            _detect_text = f"{question} {group_item}".lower()
             is_dynamic_5m = (
-                "up or down - 5 minutes" in question.lower() or 
-                "up or down - 5 minutes" in group_item.lower()
+                ("up or down" in _detect_text and "5 min" in _detect_text)
+                or "up or down - 5 minutes" in _detect_text
+                or "btc-updown-5m" in str(market_data.get("slug", "")).lower()
             )
 
             # Parse timestamps early to enforce horizon limits
