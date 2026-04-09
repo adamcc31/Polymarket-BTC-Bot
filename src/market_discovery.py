@@ -90,6 +90,7 @@ class MarketDiscovery:
         self._running = False
         self._last_log_time: float = 0.0
         self._candidate_pool: list[dict[str, Any]] = []
+        self._vatic_cache: dict[str, Any] = {"epoch": None, "price": None}
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -181,10 +182,6 @@ class MarketDiscovery:
             self._state = DiscoveryState.SEARCHING
             return
 
-        # --- Strike Upgrade Checker ---
-        # If we are using a synthetic Binance spot fallback, keep polling for oracle update.
-        await self._refresh_strike_if_synthetic()
-
         now = datetime.now(timezone.utc)
         ttr_seconds = (self._active_market.T_resolution - now).total_seconds()
         ttr_minutes = ttr_seconds / 60.0
@@ -215,49 +212,6 @@ class MarketDiscovery:
             )
 
         await self._sleep_epoch_synchronized(self._poll_interval)
-
-    async def _refresh_strike_if_synthetic(self) -> None:
-        """
-        Jika strike masih berupa spot fallback, coba ambil groupItemThreshold 
-        dari API. Jika sudah tersedia, upgrade ke nilai resmi.
-        """
-        if not self._active_market:
-            return
-            
-        # Hanya relevan untuk 5m dynamic markets (atau format sejenis tanpa strike di judul)
-        question = self._active_market.question.lower()
-        if "up or down" not in question:
-            return
-            
-        try:
-            # Kita gunakan httpx client singkat untuk pengecekan cepat
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                # Gamma API /markets/{id} mengembalikan data detail market individual
-                resp = await client.get(
-                    f"{self.GAMMA_API_BASE}/markets/{self._active_market.market_id}"
-                )
-                if not resp.is_success:
-                    return
-                
-                data = resp.json()
-                # Cek jika oracle sudah mengisi threshold resmi
-                raw = data.get("groupItemThreshold") or data.get("initial_price") or data.get("strike_price")
-                
-                if raw:
-                    real_strike = float(raw)
-                    # Jika real_strike berbeda signifikan atau nilai lama kita hanyalah estimasi
-                    if real_strike > 1000.0 and abs(real_strike - self._active_market.strike_price) > 0.0001:
-                        self._active_market = self._active_market.model_copy(
-                            update={"strike_price": real_strike}
-                        )
-                        logger.info(
-                            "dynamic_strike_upgraded_from_oracle",
-                            market_id=self._active_market.market_id,
-                            strike=real_strike
-                        )
-        except Exception:
-            # Gagal polling strike? diam saja (silently fail) agar loop utama tetap jalan
-            pass
 
     async def _handle_waiting(self) -> None:
         """Wait mode — poll less frequently."""
@@ -519,8 +473,14 @@ class MarketDiscovery:
                                 m_patched["startDateIso"] = iso_open
                                 m_patched["startDate"] = iso_open
                                 m_patched["createdAt"] = iso_open
+
+                            # --- VATIC ORACLE HYDRATION ---
+                            # window_ts adalah tepat waktu awal epoch (timestamp)
+                            vatic_strike = await self._fetch_vatic_strike(window_ts)
+                            if vatic_strike:
+                                m_patched["groupItemThreshold"] = str(vatic_strike)
     
-                            parsed = self._parse_market(m_patched, fallback_strike=spot_price)
+                            parsed = self._parse_market(m_patched)
                             if parsed is None:
                                 logger.info(
                                     "dynamic_5m_parse_returned_none",
@@ -529,13 +489,18 @@ class MarketDiscovery:
                                     question=m.get("question", "")[:80],
                                 )
                                 continue
+
+                            # --- FILTER TIME-TO-RESOLUTION (TTR) KETAT ---
+                            # Jangan pertimbangkan epoch yang sisa waktunya di bawah 4 menit
+                            if parsed.TTR_minutes < 4.0:
+                                logger.debug(
+                                    "dynamic_5m_skipped_too_late", 
+                                    market_id=parsed.market_id, 
+                                    TTR=round(parsed.TTR_minutes, 2)
+                                )
+                                continue
     
                             if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
-                                logger.info(
-                                    "dynamic_5m_missing_token_ids",
-                                    market_id=parsed.market_id,
-                                    question=parsed.question[:80],
-                                )
                                 continue
     
                             # 5-min markets have negligible 24hr volume by design;
@@ -635,7 +600,7 @@ class MarketDiscovery:
                             skipped_reasons.append(f"Low-Volume: '${volume:,.0f}' for '{q[:50]}...'")
                         continue
 
-                    parsed = self._parse_market(m, fallback_strike=spot_price)
+                    parsed = self._parse_market(m)
                     if not parsed:
                         if len(skipped_reasons) < 5 and ("bitcoin" in q.lower() or "btc" in q.lower()):
                             skipped_reasons.append(f"ParseFailed: '{q[:50]}...'")
@@ -713,7 +678,7 @@ class MarketDiscovery:
             for pattern in self.MARKET_PATTERNS
         )
 
-    def _parse_market(self, market_data: dict, fallback_strike: Optional[float] = None) -> Optional[ActiveMarket]:
+    def _parse_market(self, market_data: dict) -> Optional[ActiveMarket]:
         """
         Parse market JSON into ActiveMarket schema.
         CRITICAL: Strike price extracted from question text / metadata.
@@ -801,13 +766,8 @@ class MarketDiscovery:
             if strike_price is None:
                 question_l = question.lower()
                 if is_dynamic_5m:
-                    if fallback_strike and fallback_strike > 1000.0:
-                        strike_price = fallback_strike
-                        logger.info("dynamic_strike_using_spot_fallback", 
-                                    market_id=market_id, strike=strike_price)
-                    else:
-                        # Not an unsupported market, just waiting for the API to lock the price!
-                        logger.info("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
+                    # Not an unsupported market, just waiting for the API to lock the price!
+                    logger.info("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
                 elif "up or down" in question_l and "from $" not in question_l:
                     logger.info(
                         "unsupported_market_type_no_strike",
@@ -994,6 +954,33 @@ class MarketDiscovery:
                 return price if price > 0 else None
         except Exception:
             return None
+
+    async def _fetch_vatic_strike(self, epoch_ts: int) -> Optional[float]:
+        """Fetch precise strike price from Vatic Oracle with epoch caching."""
+        if self._vatic_cache["epoch"] == epoch_ts and self._vatic_cache["price"] is not None:
+            return self._vatic_cache["price"]
+
+        url = "https://api.vatic.trading/api/v1/targets/timestamp"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    url, 
+                    params={"asset": "btc", "type": "5min", "timestamp": epoch_ts}
+                )
+                if resp.is_success:
+                    data = resp.json()
+                    # Per the documentation, they provide strike price absolute based on epoch timestamp.
+                    price = data.get("target_price") or data.get("target") or data.get("price")
+                    if price:
+                        price_float = float(price)
+                        # Simpan ke cache
+                        self._vatic_cache = {"epoch": epoch_ts, "price": price_float}
+                        logger.info("vatic_oracle_strike_acquired", epoch=epoch_ts, strike=price_float)
+                        return price_float
+        except Exception as e:
+            logger.debug("vatic_api_fetch_failed", epoch=epoch_ts, error=str(e))
+            
+        return None
 
     def _resolve_signal_ttr_window(self, market: ActiveMarket) -> tuple[float, float]:
         """
