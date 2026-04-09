@@ -398,109 +398,135 @@ class MarketDiscovery:
         candidates: list[dict] = []
 
         async with httpx.AsyncClient(timeout=15.0) as client:
-            for slug in event_slugs:
-                try:
-                    resp = await client.get(
-                        f"{self.GAMMA_API_BASE}/events",
-                        params={"slug": slug, "limit": 1},
-                    )
-                    resp.raise_for_status()
-                    payload = resp.json()
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            for base_slug in event_slugs:
+                window_seconds = 300
+                if "15m" in base_slug:
+                    window_seconds = 900
+                elif "1h" in base_slug:
+                    window_seconds = 3600
 
-                    # Gamma may return a list or {"data": [...]}
-                    if isinstance(payload, dict):
-                        payload = payload.get("data", [payload])
-                    if not isinstance(payload, list) or not payload:
-                        logger.warning("dynamic_5m_event_not_found", slug=slug)
-                        continue
+                current_window_ts = (now_ts // window_seconds) * window_seconds
 
-                    event = payload[0]
-                    sub_markets: list[dict] = event.get("markets", [])
+                for offset in (0, 1):
+                    window_ts = current_window_ts + (offset * window_seconds)
+                    slug = f"{base_slug.strip()}-{window_ts}"
 
-                    if not sub_markets:
-                        logger.warning("dynamic_5m_event_has_no_markets", slug=slug,
-                                       event_id=event.get("id"))
-                        continue
-
-                    for m in sub_markets:
-                        # Basic activity check
-                        if not m.get("active") or m.get("closed"):
-                            continue
-                        if not m.get("enableOrderBook"):
-                            continue
-
-                        # --- Patch T_open: use T_resolution − 5 min ---
-                        # The event-level startDate is the series creation date,
-                        # NOT the current 5-min window open time. Fix it here so
-                        # _parse_market's lifespan check does not reject the market.
-                        end_date_str = (
-                            m.get("end_date_iso") or m.get("endDateIso") or m.get("endDate", "")
+                    try:
+                        # 1. Path-based lookup
+                        resp = await client.get(
+                            f"{self.GAMMA_API_BASE}/events/slug/{slug}",
+                            headers={"Accept": "application/json"}
                         )
-                        T_res = self._parse_timestamp(end_date_str)
-                        m_patched = dict(m)
-                        if T_res is not None:
-                            synthetic_open = T_res - timedelta(minutes=5)
-                            iso_open = synthetic_open.isoformat()
-                            # Overwrite all possible startDate field names
-                            m_patched["startDateIso"] = iso_open
-                            m_patched["startDate"] = iso_open
-                            m_patched["createdAt"] = iso_open
-
-                        parsed = self._parse_market(m_patched)
-                        if parsed is None:
-                            logger.info(
-                                "dynamic_5m_parse_returned_none",
-                                slug=slug,
-                                market_id=m.get("conditionId") or m.get("id"),
-                                question=m.get("question", "")[:80],
+                        
+                        if resp.is_success:
+                            payload = resp.json()
+                            if payload and isinstance(payload, dict) and payload.get("slug"):
+                                event = payload
+                            else:
+                                continue
+                        else:
+                            # 2. Query fallback lookup
+                            resp = await client.get(
+                                f"{self.GAMMA_API_BASE}/events",
+                                params={"slug": slug, "limit": 1},
+                                headers={"Accept": "application/json"}
                             )
-                            continue
+                            if not resp.is_success:
+                                continue
+                            
+                            payload = resp.json()
+                            if isinstance(payload, dict):
+                                payload = payload.get("data", [payload])
+                            if not isinstance(payload, list) or not payload:
+                                continue
+                            event = payload[0]
 
-                        if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                        sub_markets: list[dict] = event.get("markets", [])
+
+                        if not sub_markets:
+                            logger.warning("dynamic_5m_event_has_no_markets", slug=slug,
+                                           event_id=event.get("id"))
+                            continue
+    
+                        for m in sub_markets:
+                            # Basic activity check
+                            if not m.get("active") or m.get("closed"):
+                                continue
+                            if not m.get("enableOrderBook"):
+                                continue
+    
+                            # --- Patch T_open: use T_resolution − 5 min ---
+                            # The event-level startDate is the series creation date,
+                            # NOT the current 5-min window open time. Fix it here so
+                            # _parse_market's lifespan check does not reject the market.
+                            end_date_str = (
+                                m.get("end_date_iso") or m.get("endDateIso") or m.get("endDate", "")
+                            )
+                            T_res = self._parse_timestamp(end_date_str)
+                            m_patched = dict(m)
+                            if T_res is not None:
+                                synthetic_open = T_res - timedelta(minutes=5)
+                                iso_open = synthetic_open.isoformat()
+                                # Overwrite all possible startDate field names
+                                m_patched["startDateIso"] = iso_open
+                                m_patched["startDate"] = iso_open
+                                m_patched["createdAt"] = iso_open
+    
+                            parsed = self._parse_market(m_patched)
+                            if parsed is None:
+                                logger.info(
+                                    "dynamic_5m_parse_returned_none",
+                                    slug=slug,
+                                    market_id=m.get("conditionId") or m.get("id"),
+                                    question=m.get("question", "")[:80],
+                                )
+                                continue
+    
+                            if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                                logger.info(
+                                    "dynamic_5m_missing_token_ids",
+                                    market_id=parsed.market_id,
+                                    question=parsed.question[:80],
+                                )
+                                continue
+    
+                            # 5-min markets have negligible 24hr volume by design;
+                            # use total volume (all-time) as the liquidity signal instead.
+                            volume = float(
+                                m.get("volume") or m.get("volumeNum", 0.0) or
+                                m.get("volume24hr", 0.0) or 0.0
+                            )
+                            yes_prob = self._extract_yes_probability(m)
+                            score_components = self._score_candidate(
+                                market=parsed,
+                                volume_24h=volume,
+                                yes_prob=yes_prob,
+                                spot_price=spot_price,
+                            )
+                            candidates.append(
+                                {
+                                    "market": parsed,
+                                    "volume": volume,
+                                    "yes_prob": yes_prob,
+                                    "score": score_components["score_total"],
+                                    "score_components": score_components,
+                                    "source": f"event:{slug}",
+                                }
+                            )
                             logger.info(
-                                "dynamic_5m_missing_token_ids",
+                                "dynamic_5m_candidate_found",
                                 market_id=parsed.market_id,
                                 question=parsed.question[:80],
+                                TTR_minutes=round(parsed.TTR_minutes, 2),
+                                strike_price=parsed.strike_price,
+                                yes_prob=yes_prob,
+                                slug=slug,
                             )
-                            continue
-
-                        # 5-min markets have negligible 24hr volume by design;
-                        # use total volume (all-time) as the liquidity signal instead.
-                        volume = float(
-                            m.get("volume") or m.get("volumeNum", 0.0) or
-                            m.get("volume24hr", 0.0) or 0.0
-                        )
-                        yes_prob = self._extract_yes_probability(m)
-                        score_components = self._score_candidate(
-                            market=parsed,
-                            volume_24h=volume,
-                            yes_prob=yes_prob,
-                            spot_price=spot_price,
-                        )
-                        candidates.append(
-                            {
-                                "market": parsed,
-                                "volume": volume,
-                                "yes_prob": yes_prob,
-                                "score": score_components["score_total"],
-                                "score_components": score_components,
-                                "source": f"event:{slug}",
-                            }
-                        )
-                        logger.info(
-                            "dynamic_5m_candidate_found",
-                            market_id=parsed.market_id,
-                            question=parsed.question[:80],
-                            TTR_minutes=round(parsed.TTR_minutes, 2),
-                            strike_price=parsed.strike_price,
-                            yes_prob=yes_prob,
-                            slug=slug,
-                        )
-
-                except httpx.HTTPError as e:
-                    logger.warning("dynamic_5m_event_http_error", slug=slug, error=str(e))
-                except Exception as e:
-                    logger.warning("dynamic_5m_event_parse_error", slug=slug, error=str(e))
+                    except httpx.HTTPError as e:
+                        logger.warning("dynamic_5m_event_http_error", slug=slug, error=str(e))
+                    except Exception as e:
+                        logger.warning("dynamic_5m_event_parse_error", slug=slug, error=str(e))
 
         return candidates
 

@@ -27,3 +27,6 @@ models/
 .vscode/
 .DS_Store
 Thumbs.db
+
+#example project
+example_project
