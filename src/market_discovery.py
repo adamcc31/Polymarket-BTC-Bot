@@ -128,6 +128,34 @@ class MarketDiscovery:
         self._running = False
         logger.info("market_discovery_stopped")
 
+    async def _sleep_epoch_synchronized(self, base_interval: float) -> None:
+        """
+        Epoch Tracking & Latency Mitigation:
+        Polymarket 5-minute markets refresh exactly on the 5-minute bounds (e.g., :00, :05, :10).
+        This method predicts the sub-market transition and tightens the polling rate
+        to 500ms loops during the critical transition window to beat API latency.
+        """
+        now = datetime.now(timezone.utc)
+        minutes_past = now.minute % 5
+        seconds_past = minutes_past * 60 + now.second + (now.microsecond / 1000000.0)
+        seconds_to_epoch = (5 * 60) - seconds_past
+
+        # 1. Active Transition Window latency mitigation (0 to 3 seconds past epoch)
+        # Pull data aggressively with 500ms intervals!
+        if seconds_past < 3.0:
+            await asyncio.sleep(0.5)
+            return
+
+        # 2. Precision Timer
+        # If the next epoch hits before our normal sleep ends, sleep EXACTLY until the epoch!
+        if seconds_to_epoch <= base_interval:
+            # Wake up 50ms after the epoch rolls over
+            await asyncio.sleep(seconds_to_epoch + 0.05)
+            return
+
+        # 3. Default Polling
+        await asyncio.sleep(base_interval)
+
     async def _handle_searching(self) -> None:
         """Poll for active markets."""
         market = await self._find_active_market()
@@ -145,7 +173,7 @@ class MarketDiscovery:
         else:
             self._state = DiscoveryState.WAITING
             logger.info("no_active_market_found", transitioning_to="WAITING")
-        await asyncio.sleep(self._poll_interval)
+        await self._sleep_epoch_synchronized(self._poll_interval)
 
     async def _handle_active(self) -> None:
         """Monitor active market TTR and validity."""
@@ -182,7 +210,7 @@ class MarketDiscovery:
                 update={"TTR_minutes": ttr_minutes}
             )
 
-        await asyncio.sleep(self._poll_interval)
+        await self._sleep_epoch_synchronized(self._poll_interval)
 
     async def _handle_waiting(self) -> None:
         """Wait mode — poll less frequently."""
@@ -204,7 +232,7 @@ class MarketDiscovery:
                 strike_price=market.strike_price,
                 TTR_minutes=market.TTR_minutes,
             )
-        await asyncio.sleep(self._waiting_poll)
+        await self._sleep_epoch_synchronized(self._waiting_poll)
 
     def force_rediscover(self) -> None:
         """
@@ -501,20 +529,52 @@ class MarketDiscovery:
             if ttr_minutes <= 0:
                 return None
                 
-            # Extract strike price from question text
-            strike_price = self._extract_strike_price(question)
+            # ----------------------------------------------------
+            # DYNAMIC STRIKE EXTRACTION (Bypass Regex)
+            # ----------------------------------------------------
+            group_item = market_data.get("groupItemTitle", "")
+            
+            # Check if this is a dynamic 5-minute market
+            is_dynamic_5m = (
+                "up or down - 5 minutes" in question.lower() or 
+                "up or down - 5 minutes" in group_item.lower()
+            )
+
+            strike_price = None
+
+            if is_dynamic_5m:
+                # API Payload Extraction: grab the Price To Beat from raw JSON values
+                raw_target = (
+                    market_data.get("groupItemThreshold") or 
+                    market_data.get("initial_price") or 
+                    market_data.get("strike_price")
+                )
+                if raw_target is not None:
+                    try:
+                        extracted = float(raw_target)
+                        # Ensure it's populated and not exactly 0 (which may happen precisely at 00:00 before oracle update)
+                        if extracted > 1000.0: 
+                            strike_price = extracted
+                    except (ValueError, TypeError):
+                        pass
+
+            # ----------------------------------------------------
+            # TEXT REGEX EXTRACTION (Fallback / Standard)
+            # ----------------------------------------------------
             if strike_price is None:
-                # Multi-market events often store leg-like text here.
-                group_item = market_data.get("groupItemTitle", "")
+                strike_price = self._extract_strike_price(question)
+            if strike_price is None:
                 strike_price = self._extract_strike_price(group_item)
             if strike_price is None:
-                # Try from description
                 desc = market_data.get("description", "")
                 strike_price = self._extract_strike_price(desc)
+                
             if strike_price is None:
                 question_l = question.lower()
-                # Keep logs clean for known non-strike "directional" products.
-                if "up or down" in question_l and "from $" not in question_l:
+                if is_dynamic_5m:
+                    # Not an unsupported market, just waiting for the API to lock the price!
+                    logger.debug("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
+                elif "up or down" in question_l and "from $" not in question_l:
                     logger.info(
                         "unsupported_market_type_no_strike",
                         market_id=market_id,
