@@ -501,6 +501,15 @@ class MarketDiscovery:
                 or market_data.get("id", "")
             )
             question = market_data.get("question", "")
+            group_item = market_data.get("groupItemTitle", "")
+
+            # ----------------------------------------------------
+            # DYNAMIC 5-MIN DETECTION
+            # ----------------------------------------------------
+            is_dynamic_5m = (
+                "up or down - 5 minutes" in question.lower() or 
+                "up or down - 5 minutes" in group_item.lower()
+            )
 
             # Parse timestamps early to enforce horizon limits
             end_date_str = market_data.get("end_date_iso") or market_data.get("endDate", "")
@@ -517,28 +526,20 @@ class MarketDiscovery:
 
             lifespan_minutes = (T_resolution - T_open).total_seconds() / 60.0
             
-            # Enforce strictly short-horizon markets (skip Dailies/Weeklies)
-            target_horizons = self._config.get("market_discovery.target_horizons_minutes", [5.0])
-            max_horizon = max(target_horizons) * 3.0  # Max 15 minutes for a 5min target
-            if lifespan_minutes > max_horizon:
-                return None  # Silently skip long-horizon markets
+            # Enforce strictly short-horizon markets, BUT BYPASS NO-STRIKE 5-MINUTE MARKETS!
+            # Polymarket mints dynamic markets early, so their lifespan_minutes > 15!
+            if not is_dynamic_5m:
+                target_horizons = self._config.get("market_discovery.target_horizons_minutes", [5.0])
+                max_horizon = max(target_horizons) * 3.0  # Max 15 minutes for a 5min target
+                if lifespan_minutes > max_horizon:
+                    # logger.debug("skipped_long_horizon", market_id=market_id, lifespan=lifespan_minutes)
+                    return None  # Silently skip long-horizon markets
 
             now = datetime.now(timezone.utc)
             ttr_minutes = (T_resolution - now).total_seconds() / 60.0
 
             if ttr_minutes <= 0:
                 return None
-                
-            # ----------------------------------------------------
-            # DYNAMIC STRIKE EXTRACTION (Bypass Regex)
-            # ----------------------------------------------------
-            group_item = market_data.get("groupItemTitle", "")
-            
-            # Check if this is a dynamic 5-minute market
-            is_dynamic_5m = (
-                "up or down - 5 minutes" in question.lower() or 
-                "up or down - 5 minutes" in group_item.lower()
-            )
 
             strike_price = None
 
