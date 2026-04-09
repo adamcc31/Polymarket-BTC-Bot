@@ -456,26 +456,6 @@ class MarketDiscovery:
                             if not m.get("enableOrderBook"):
                                 continue
     
-                            # --- LIVE HYDRATION UNTUK MENGAKALI CACHE ---
-                            market_id = m.get("conditionId") or m.get("id")
-                            raw_target = m.get("groupItemThreshold") or m.get("initial_price")
-                            try:
-                                if not raw_target or float(raw_target) < 1000:
-                                    live_resp = await client.get(
-                                        f"{self.GAMMA_API_BASE}/markets",
-                                        params={"condition_id": market_id},
-                                        headers={"Accept": "application/json"}
-                                    )
-                                    if live_resp.is_success:
-                                        live_data = live_resp.json()
-                                        if isinstance(live_data, list) and len(live_data) > 0:
-                                            live_market = live_data[0]
-                                            # Timpa data cache dengan data live
-                                            m.update(live_market)
-                            except Exception as e:
-                                logger.debug("live_hydration_failed", market_id=market_id, error=str(e))
-                            # ---------------------------------------------
-
                             # --- Patch T_open: use T_resolution − 5 min ---
                             # The event-level startDate is the series creation date,
                             # NOT the current 5-min window open time. Fix it here so
@@ -485,8 +465,6 @@ class MarketDiscovery:
                             )
                             T_res = self._parse_timestamp(end_date_str)
                             m_patched = dict(m)
-                            m_patched["slug"] = slug  # INJEKSI SLUG UNTUK is_5m_target
-                            
                             if T_res is not None:
                                 synthetic_open = T_res - timedelta(minutes=5)
                                 iso_open = synthetic_open.isoformat()
@@ -622,7 +600,7 @@ class MarketDiscovery:
                     seen_ids.add(parsed.market_id)
 
                     # Bypass strict TTR minimum for 5-minute dynamic markets
-                    is_5m_target = "btc-updown-5m" in str(m.get("slug", "")).lower() or "btc-updown-5m" in str(m.get("eventSlug", "")).lower()
+                    is_5m_target = "5 minute" in parsed.question.lower()
                     if is_5m_target or parsed.TTR_minutes >= self._min_ttr:
                         # Ensure CLOB tradability: must have YES/NO token IDs.
                         if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
