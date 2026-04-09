@@ -423,14 +423,18 @@ class MarketDiscovery:
                         continue
 
                     parsed = self._parse_market(m)
-                    if parsed and parsed.TTR_minutes >= self._min_ttr:
-                        # Ensure CLOB tradability: must have YES/NO token IDs.
-                        if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
-                            if len(skipped_reasons) < 5:
-                                skipped_reasons.append(
-                                    f"Missing-Token-IDs: '{q[:50]}...'"
-                                )
-                            continue
+                    if parsed:
+                        # Bypass strict TTR minimum for 5-minute dynamic markets
+                        is_5m_target = "5 minute" in parsed.question.lower()
+                        
+                        if is_5m_target or parsed.TTR_minutes >= self._min_ttr:
+                            # Ensure CLOB tradability: must have YES/NO token IDs.
+                            if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                                if len(skipped_reasons) < 5:
+                                    skipped_reasons.append(
+                                        f"Missing-Token-IDs: '{q[:50]}...'"
+                                    )
+                                continue
 
                         # Basis-risk policy: only hard-skip if explicitly configured.
                         non_binance_policy = self._config.get(
@@ -574,7 +578,7 @@ class MarketDiscovery:
                 question_l = question.lower()
                 if is_dynamic_5m:
                     # Not an unsupported market, just waiting for the API to lock the price!
-                    logger.debug("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
+                    logger.info("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
                 elif "up or down" in question_l and "from $" not in question_l:
                     logger.info(
                         "unsupported_market_type_no_strike",
