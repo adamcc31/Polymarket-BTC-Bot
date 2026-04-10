@@ -717,12 +717,7 @@ class TradingBot:
     # ── Ultra-Short Market Evaluation Loop ─────────────────────
 
     async def _ultrashort_market_loop(self) -> None:
-        """30-second evaluation loop for markets ≤ 10 minutes.
-
-        Standard 15-min bar close is too slow for 5-minute markets.
-        This injects a synthetic bar every 30 seconds to trigger the
-        full signal pipeline at a cadence matching ultra-short horizons.
-        """
+        """30-second evaluation loop for markets ≤ 10 minutes."""
         while self._running:
             await asyncio.sleep(10)
 
@@ -739,7 +734,12 @@ class TradingBot:
 
             btc_price = self._binance.latest_price
             if btc_price is None:
+                # TAMBAHKAN LOG INI UNTUK VISIBILITAS
+                logger.warning("ultrashort_loop_skipped", reason="btc_price_is_none")
                 continue
+
+            # TAMBAHKAN LOG INI UNTUK MEMASTIKAN LOOP BERJALAN
+            logger.info("ultrashort_loop_triggering_evaluation", btc_price=btc_price, market_id=market.market_id)
 
             synthetic_bar = {
                 "close": btc_price,
