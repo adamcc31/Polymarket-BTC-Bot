@@ -425,8 +425,8 @@ class TradingBot:
         # Market discovery identifies dynamic 5m markets. If they have no book depth
         # (common in first 60s), we inject a tight synthetic 50/50 book.
         if not clob_state or not clob_state.is_liquid:
-            lifespan_min = (market.T_resolution - market.T_open).total_seconds() / 60.0
-            if lifespan_min <= 10.0:
+            is_ultrashort = "5m" in market.slug or (market.T_resolution - market.T_open).total_seconds() / 60.0 <= 10.0
+            if is_ultrashort:
                 from src.schemas import CLOBState
                 clob_state = CLOBState(
                     market_id=market.market_id,
@@ -774,8 +774,8 @@ class TradingBot:
             if market is None:
                 continue
 
-            lifespan_seconds = (market.T_resolution - market.T_open).total_seconds()
-            if lifespan_seconds > 600:  # Only for ≤ 10 minute markets
+            is_ultrashort = "5m" in market.slug or (market.T_resolution - market.T_open).total_seconds() <= 600
+            if not is_ultrashort:
                 continue
 
             btc_price = self._binance.latest_price

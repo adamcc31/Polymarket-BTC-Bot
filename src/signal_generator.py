@@ -59,12 +59,14 @@ class SignalGenerator:
         lifespan_min = lifespan_h * 60.0
 
         # Ultra-short market (≤ 10 minutes lifespan)
-        if lifespan_min <= 10.0:
+        is_ultrashort = "5m" in active_market.slug or lifespan_min <= 10.0
+        if is_ultrashort:
+            actual_lifespan = 5.0 if "5m" in active_market.slug else lifespan_min
             entry_open_pct = float(self._config.get("signal.ultrashort_entry_open_pct", 0.80))
             entry_close_pct = float(self._config.get("signal.ultrashort_entry_close_pct", 0.10))
             return (
-                lifespan_min * entry_close_pct,
-                lifespan_min * entry_open_pct,
+                actual_lifespan * entry_close_pct,
+                actual_lifespan * entry_open_pct,
             )
 
         if lifespan_h <= 2.0:
@@ -296,8 +298,7 @@ class SignalGenerator:
         mid_yes = (clob_state.yes_bid + clob_state.yes_ask) / 2.0
         
         # Bypass deadband for ultra-short markets – we WANT to trade at the money
-        lifespan_min = (active_market.T_resolution - active_market.T_open).total_seconds() / 60.0
-        is_ultrashort = lifespan_min <= 10.0
+        is_ultrashort = "5m" in active_market.slug or (active_market.T_resolution - active_market.T_open).total_seconds() / 60.0 <= 10.0
         
         if not is_ultrashort and abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
             logger.debug(

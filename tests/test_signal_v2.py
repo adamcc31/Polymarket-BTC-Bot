@@ -97,6 +97,7 @@ class SignalV2Tests(unittest.TestCase):
 
         active = ActiveMarket(
             market_id=market_id,
+            slug=market_id,
             question="q",
             strike_price=100.0,
             T_open=now - timedelta(hours=1),
@@ -126,6 +127,7 @@ class SignalV2Tests(unittest.TestCase):
 
         active = ActiveMarket(
             market_id=market_id,
+            slug=market_id,
             question="q",
             strike_price=100.0,
             T_open=now - timedelta(hours=1),
@@ -153,6 +155,7 @@ class SignalV2Tests(unittest.TestCase):
 
         active = ActiveMarket(
             market_id=market_id,
+            slug=market_id,
             question="q",
             strike_price=100.0,
             T_open=now - timedelta(hours=1),

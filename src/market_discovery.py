@@ -698,6 +698,7 @@ class MarketDiscovery:
                 or market_data.get("condition_id")
                 or market_data.get("id", "")
             )
+            slug = market_data.get("slug", "")
             question = market_data.get("question", "")
             group_item = market_data.get("groupItemTitle", "")
 
@@ -817,6 +818,7 @@ class MarketDiscovery:
 
             return ActiveMarket(
                 market_id=market_id,
+                slug=slug,
                 question=question,
                 strike_price=strike_price,
                 T_open=T_open,

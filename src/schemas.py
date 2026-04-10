@@ -22,6 +22,7 @@ class ActiveMarket(BaseModel):
     """Represents a currently active Polymarket market."""
 
     market_id: str = Field(..., description="Polymarket condition_id")
+    slug: str = Field(..., description="Polymarket URL slug")
     question: str = Field(..., description="Market question text for verification")
     strike_price: float = Field(
         ...,

@@ -99,6 +99,7 @@ def make_ultrashort_market(now, lifespan_minutes=5.0, ttr_minutes=3.0,
     T_resolution = now + timedelta(minutes=ttr_minutes)
     return ActiveMarket(
         market_id=market_id,
+        slug=market_id,
         question=f"BTC 5 minute up or down from ${strike_price:,.0f}?",
         strike_price=strike_price,
         T_open=T_open,
@@ -197,6 +198,7 @@ class TestNearExpiryBias(unittest.TestCase):
         # Normal: 60 min lifespan, 2 min TTR
         market = ActiveMarket(
             market_id="normal1",
+            slug="normal1",
             question="Bitcoin Up or Down from $83,000?",
             strike_price=83000.0,
             T_open=now - timedelta(minutes=58),
@@ -351,6 +353,7 @@ class TestBacktestSimulation(unittest.TestCase):
         for i, (strike, btc_entry, btc_resolve, clob_yes_ask) in enumerate(scenarios):
             market = ActiveMarket(
                 market_id=f"sim_{i}",
+                slug=f"sim_{i}",
                 question=f"BTC 5 minute up or down from ${strike:,}?",
                 strike_price=float(strike),
                 T_open=now + timedelta(minutes=i*6),
