@@ -4,11 +4,11 @@
   "regime": {
     "vol_lower_threshold": 0.15,
     "vol_upper_threshold": 0.8,
-    "binance_spread_max_bps": 5.0,
+    "binance_spread_max_bps": 15.0,
     "binance_min_depth_btc": 0.5
   },
   "signal": {
-    "margin_of_safety": 0.05,
+    "margin_of_safety": 0.02,
     "ttr_min_minutes": 5.0,
     "ttr_max_minutes": 12.0,
     "dynamic_ttr_enabled": true,
@@ -103,12 +103,16 @@
     "freeze_when_in_entry_window": true,
     "cooldown_after_trade_minutes": 2.0
   },
+  "execution": {
+    "taker_edge_threshold": 0.04
+  },
   "fair_prob": {
-    "base_uncertainty_p": 0.03,
+    "base_uncertainty_p": 0.02,
     "near_expiry_u_boost": 0.10
   },
   "telegram": {
     "enabled": true,
-    "timeout_seconds": 10.0
+    "timeout_seconds": 10.0,
+    "report_interval_hours": 2.0
   }
 }

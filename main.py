@@ -122,7 +122,7 @@ class TradingBot:
         self._telegram = TelegramNotifier(self._config)
 
         # Dry run / live engine
-        initial_capital = 100.0 if self._requested_mode == "dry-run" else 50.0
+        initial_capital = 50.0 if self._requested_mode == "dry-run" else 50.0
         self._dry_run = DryRunEngine(self._config, initial_capital=initial_capital)
         self._exporter = Exporter(self._dry_run.session_id)
 
@@ -184,9 +184,9 @@ class TradingBot:
             await asyncio.sleep(interval_s)
 
     async def _telegram_periodic_report_loop(self) -> None:
-        """Periodic 6-hour summary report and trades.csv dump."""
-        # 6 hours in seconds
-        interval_s = 6 * 3600.0
+        """Periodic summary report and trades.csv dump (default: every 2 hours)."""
+        report_hours = float(self._config.get("telegram.report_interval_hours", 2.0))
+        interval_s = report_hours * 3600.0
         while self._running:
             await asyncio.sleep(interval_s)
             if not self._running:
@@ -199,6 +199,7 @@ class TradingBot:
                     "trades_executed": metrics.trades_executed,
                     "win_rate": f"{metrics.win_rate*100:.1f}%" if metrics.win_rate is not None else "N/A",
                     "pnl_usd": f"${metrics.total_pnl_usd:.2f}" if metrics.total_pnl_usd is not None else "N/A",
+                    "capital": f"${metrics.capital_end:.2f}" if metrics.capital_end is not None else "N/A",
                     "duration_hours": f"{metrics.duration_hours:.1f}" if metrics.duration_hours else "N/A",
                 }
                 
@@ -206,8 +207,8 @@ class TradingBot:
                 
                 trades_path = None
                 if self._exporter:
-                    # Sync trades file
-                    self._exporter.export_trades(list(self._dry_run._trades.values()))
+                    # Export trades CSV from resolved trades list
+                    self._exporter.export_trades(self._dry_run._resolved_trades)
                     trades_csv = self._exporter.session_dir / "trades.csv"
                     if trades_csv.exists():
                         trades_path = str(trades_csv)
@@ -216,15 +217,21 @@ class TradingBot:
                     try:
                         await self._telegram.send_document(
                             file_path=trades_path,
-                            caption=f"📈 <b>6-Hour Session Summary</b>\n\n{sum_text}",
+                            caption=f"Session Report ({report_hours:.0f}h)\n\n{sum_text}",
                         )
+                        logger.info("telegram_periodic_report_sent",
+                                    trades=metrics.trades_executed,
+                                    pnl=metrics.total_pnl_usd)
                     except Exception as e:
-                        logger.error("telegram_report_failed", error=str(e))
+                        logger.error("telegram_report_send_failed", error=str(e))
                 else:
-                    await self._send_telegram("📈 6-Hour Session Summary", sum_text)
+                    await self._send_telegram(
+                        f"Session Report ({report_hours:.0f}h)", sum_text
+                    )
+                    logger.info("telegram_periodic_report_sent_text_only")
                     
             except Exception as e:
-                logger.error("periodic_report_loop_error", error=str(e))
+                logger.error("periodic_report_loop_error", error=str(e), exc_info=True)
 
     async def _dry_run_time_guard(self) -> None:
         """Stop after max duration unless live gate has already enabled live."""
