@@ -135,7 +135,7 @@ class SignalGenerator:
                 # If configured to hard-abstain, stop immediately regardless of TTR.
                 edge_yes = P_model - clob_state.yes_ask
                 edge_no = (1.0 - P_model) - clob_state.no_ask
-                logger.info(
+                logger.debug(
                     "signal_abstain_basis_risk",
                     policy=non_binance_policy,
                     settlement_exchange=active_market.settlement_exchange,
@@ -166,7 +166,7 @@ class SignalGenerator:
             if metadata.TTR_minutes < non_binance_abstain_ttr_min:
                 edge_yes = P_model - clob_state.yes_ask
                 edge_no = (1.0 - P_model) - clob_state.no_ask
-                logger.info(
+                logger.debug(
                     "signal_abstain_basis_risk",
                     policy=non_binance_policy,
                     TTR_minutes=round(metadata.TTR_minutes, 2),
@@ -206,7 +206,7 @@ class SignalGenerator:
         if ttr < ttr_min or ttr > ttr_max:
             edge_yes = P_model - clob_state.yes_ask
             edge_no = (1.0 - P_model) - clob_state.no_ask
-            logger.info(
+            logger.debug(
                 "signal_abstain_ttr",
                 TTR_minutes=round(ttr, 2),
                 phase=metadata.TTR_phase,
@@ -244,7 +244,7 @@ class SignalGenerator:
         if not regime_go:
             edge_yes = P_model - clob_state.yes_ask
             edge_no = (1.0 - P_model) - clob_state.no_ask
-            logger.info(
+            logger.debug(
                 "signal_abstain_regime",
                 vol_pct=round(vol_pct, 3),
                 spread_bps=round(spread_bps, 2),
@@ -265,7 +265,7 @@ class SignalGenerator:
         if not clob_state.is_liquid or clob_state.is_stale:
             edge_yes = P_model - clob_state.yes_ask
             edge_no = (1.0 - P_model) - clob_state.no_ask
-            logger.info(
+            logger.debug(
                 "signal_abstain_liquidity",
                 is_liquid=clob_state.is_liquid,
                 is_stale=clob_state.is_stale,
@@ -300,7 +300,7 @@ class SignalGenerator:
         is_ultrashort = lifespan_min <= 10.0
         
         if not is_ultrashort and abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
-            logger.info(
+            logger.debug(
                 "signal_abstain_no_trade_zone",
                 fair_prob=round(P_model, 4),
                 mid_yes=round(mid_yes, 4),
@@ -321,7 +321,7 @@ class SignalGenerator:
         margin = self._config.get("signal.margin_of_safety", 0.05)
 
         if max(edge_yes, edge_no) <= margin:
-            logger.info(
+            logger.debug(
                 "signal_abstain_no_edge",
                 edge_yes=round(edge_yes, 4),
                 edge_no=round(edge_no, 4),

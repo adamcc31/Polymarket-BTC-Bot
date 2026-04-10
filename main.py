@@ -16,6 +16,7 @@ import html
 import os
 import signal
 import sys
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 import numpy as np
@@ -132,6 +133,7 @@ class TradingBot:
         self._telegram_heartbeat_minutes = float(
             self._config.get("telegram.heartbeat_minutes", 15.0)
         )
+        self._post_mortem_tracker = {}
 
     async def _send_telegram(self, title: str, message: str) -> None:
         """Telegram send helper (never raises)."""
@@ -493,7 +495,28 @@ class TradingBot:
         self._latest_signal = signal
         self._dry_run.record_signal(signal)
 
+        # ── Post-Mortem Aggregator ────────────────────────────
         if signal.signal == "ABSTAIN":
+            m_id = market.market_id
+            if m_id not in self._post_mortem_tracker:
+                self._post_mortem_tracker[m_id] = {
+                    "evals": 0,
+                    "reasons": Counter(),
+                    "max_edge": 0.0
+                }
+                asyncio.create_task(
+                    self._schedule_post_mortem(market),
+                    name=f"pm_{m_id[:8]}"
+                )
+            
+            stats = self._post_mortem_tracker[m_id]
+            stats["evals"] += 1
+            if signal.abstain_reason:
+                stats["reasons"][signal.abstain_reason] += 1
+            
+            current_max_edge = max(signal.edge_yes, signal.edge_no)
+            if current_max_edge > stats["max_edge"]:
+                stats["max_edge"] = current_max_edge
             return
 
         # ── Risk Management ───────────────────────────────────
@@ -667,6 +690,29 @@ class TradingBot:
             name=f"tg_resolve_{resolved.trade_id[:8]}",
         )
         await self._maybe_enable_live()
+
+    async def _schedule_post_mortem(self, market) -> None:
+        """Independent watcher to log abstention stats when a market resolves."""
+        now = datetime.now(timezone.utc)
+        wait_seconds = (market.T_resolution - now).total_seconds()
+        
+        # Wait until the market officially resolves + 5 seconds buffer
+        if wait_seconds > 0:
+            await asyncio.sleep(wait_seconds + 5)
+            
+        m_id = market.market_id
+        if m_id in self._post_mortem_tracker:
+            data = self._post_mortem_tracker.pop(m_id) # Safe extract & delete
+            
+            top_blockers = ", ".join([f"{k}({v}x)" for k, v in data["reasons"].most_common(3)])
+            
+            logger.info(
+                "epoch_post_mortem",
+                market_id=m_id,
+                total_evaluations=data["evals"],
+                max_edge_seen=round(data["max_edge"], 4),
+                top_blockers=top_blockers
+            )
 
     async def _maybe_enable_live(self) -> None:
         """Enable actual live trading after dry-run performance gates."""
