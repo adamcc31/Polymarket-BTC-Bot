@@ -170,6 +170,10 @@ class SignalResult(BaseModel):
     features: Dict[str, float] = Field(
         default_factory=dict, description="Full feature snapshot for logging"
     )
+    live_yes_ask: Optional[float] = None
+    live_no_ask: Optional[float] = None
+    synthetic_edge: Optional[float] = None
+    live_edge: Optional[float] = None
 
 
 # ============================================================
@@ -230,6 +234,11 @@ class PaperTrade(BaseModel):
     kelly_fraction: float
     kelly_multiplier: float
     capital_before: float
+    synthetic_edge: Optional[float] = None
+    live_edge: Optional[float] = None
+    btc_price_at_trigger: Optional[float] = None
+    btc_distance_to_strike: Optional[float] = None
+    trigger_timestamp: Optional[datetime] = None
 
     # Filled post-resolution
     btc_at_resolution: Optional[float] = None

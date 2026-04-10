@@ -400,6 +400,16 @@ class TradingBot:
         market = self._discovery.active_market
         await self._discovery.refresh_ttr()
 
+        # ── STEP 1: min_ttr_minutes Gate ─────────────────────
+        min_ttr = float(self._config.get("signal.min_ttr_minutes", 1.5))
+        if market.TTR_minutes < min_ttr:
+            logger.debug(
+                "signal_skipped_late_ttr",
+                TTR_minutes=round(market.TTR_minutes, 2),
+                min_ttr=min_ttr,
+            )
+            return
+
         # ── Bar-close rotation check ──────────────────────────
         # Aligned here (not on an independent timer) so market switches never
         # interrupt a Z-score computation mid-window.
@@ -518,6 +528,49 @@ class TradingBot:
             if current_max_edge > stats["max_edge"]:
                 stats["max_edge"] = current_max_edge
             return
+
+        # ── STEP 2: Live Edge Verification (Execution Gates) ──────────
+        fresh_clob = await self._clob.fetch_clob_snapshot(market)
+        if not fresh_clob:
+            logger.warning("live_verification_failed_clob_unavailable")
+            return
+
+        real_best_ask = fresh_clob.yes_ask if signal.signal == "BUY_YES" else fresh_clob.no_ask
+        synthetic_edge = signal.edge_yes if signal.signal == "BUY_YES" else signal.edge_no
+        p_outcome = signal.P_model if signal.signal == "BUY_YES" else (1.0 - signal.P_model)
+        live_edge = p_outcome - signal.uncertainty_u - real_best_ask
+        edge_deviation = abs(synthetic_edge - live_edge)
+
+        max_buy_price = float(self._config.get("risk.max_buy_price", 0.75))
+        edge_tolerance = float(self._config.get("risk.live_edge_tolerance", 0.05))
+        margin_of_safety = float(self._config.get("signal.margin_of_safety", 0.02))
+
+        # Gate 1: Hard Cap
+        if real_best_ask > max_buy_price:
+            logger.info("trade_aborted", reason="PRICE_EXCEEDS_MAX_CAP", price=real_best_ask, cap=max_buy_price)
+            return
+
+        # Gate 2: Tolerance
+        if edge_deviation > edge_tolerance:
+            logger.info("trade_aborted", reason="EDGE_DEVIATION_TOO_HIGH", synthetic=round(synthetic_edge, 4), live=round(live_edge, 4), dev=round(edge_deviation, 4))
+            return
+
+        # Gate 3: Live Edge Positive
+        if live_edge <= margin_of_safety:
+            logger.info("trade_aborted", reason="LIVE_EDGE_NEGATIVE", live_edge=round(live_edge, 4), threshold=margin_of_safety)
+            return
+
+        # Update signal with live verification data for risk and logging
+        signal.live_yes_ask = fresh_clob.yes_ask
+        signal.live_no_ask = fresh_clob.no_ask
+        signal.synthetic_edge = synthetic_edge
+        signal.live_edge = live_edge
+        
+        # Override CLOB prices in signal to ensure Kelly uses real_best_ask
+        if signal.signal == "BUY_YES":
+            signal.clob_yes_ask = real_best_ask
+        else:
+            signal.clob_no_ask = real_best_ask
 
         # ── Risk Management ───────────────────────────────────
         result = await self._risk_mgr.approve(signal, self._dry_run.capital)

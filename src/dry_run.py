@@ -144,6 +144,10 @@ class DryRunEngine:
             else float(approved_bet.bet_size)
         )
 
+        btc_price_at_trigger = signal.current_price
+        strike_price = active_market.strike_price
+        dist_to_strike = btc_price_at_trigger - strike_price
+
         trade = PaperTrade(
             trade_id=str(uuid.uuid4()),
             session_id=self._session_id,
@@ -151,7 +155,7 @@ class DryRunEngine:
             signal_type=signal.signal,
             entry_price=entry_price,
             bet_size=bet_size,
-            strike_price=active_market.strike_price,
+            strike_price=strike_price,
             T_resolution=active_market.T_resolution,
             TTR_at_entry=signal.TTR_minutes,
             P_model=signal.P_model,
@@ -160,7 +164,12 @@ class DryRunEngine:
             kelly_fraction=approved_bet.kelly_fraction,
             kelly_multiplier=approved_bet.kelly_multiplier,
             capital_before=self._capital,
-            timestamp_signal=datetime.now(timezone.utc),
+            synthetic_edge=signal.synthetic_edge,
+            live_edge=signal.live_edge,
+            btc_price_at_trigger=btc_price_at_trigger,
+            btc_distance_to_strike=dist_to_strike,
+            trigger_timestamp=datetime.now(timezone.utc),
+            timestamp_signal=signal.timestamp,
         )
 
         self._pending_trades.append(trade)

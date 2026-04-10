@@ -21,7 +21,8 @@
     "probability_source": "fair",
     "hybrid_fair_weight": 0.7,
     "hybrid_model_weight": 0.3,
-    "no_trade_deadband": 0.00
+    "no_trade_deadband": 0.00,
+    "min_ttr_minutes": 1.5
   },
   "clob": {
     "min_depth_usd": 10.0,
@@ -34,10 +35,12 @@
     "kelly_divisor": 2,
     "max_bet_fraction": 0.1,
     "min_bet_usd": 1.0,
-    "daily_loss_limit_pct": 0.05,
-    "session_loss_limit_pct": 0.03,
+    "daily_loss_limit_pct": 0.90,
+    "session_loss_limit_pct": 0.90,
     "consecutive_loss_multiplier": 0.15,
-    "kelly_floor_multiplier": 0.25
+    "kelly_floor_multiplier": 0.25,
+    "max_buy_price": 0.75,
+    "live_edge_tolerance": 0.05
   },
   "dry_run": {
     "pass_win_rate": 0.53,
