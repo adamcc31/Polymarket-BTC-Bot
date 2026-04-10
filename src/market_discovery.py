@@ -806,6 +806,15 @@ class MarketDiscovery:
                 resolution_source,
             ) = self._extract_settlement_descriptor(market_data)
 
+            # Explicit override for dynamic 5m markets where we KNOW the source
+            # but Polymarket metadata might be empty/generic.
+            if is_dynamic_5m:
+                settlement_exchange = "BINANCE"
+                settlement_granularity = "1m"
+                settlement_instrument = "BTCUSDT"
+                settlement_price_type = "close"
+                resolution_source = "Binance"
+
             return ActiveMarket(
                 market_id=market_id,
                 question=question,

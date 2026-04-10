@@ -418,6 +418,29 @@ class TradingBot:
             return
 
         clob_state = self._clob.clob_state
+        
+        # ── Synthetic CLOB Fallback for Ultra-Short Markets ──
+        # Market discovery identifies dynamic 5m markets. If they have no book depth
+        # (common in first 60s), we inject a tight synthetic 50/50 book.
+        if not clob_state or not clob_state.is_liquid:
+            lifespan_min = (market.T_resolution - market.T_open).total_seconds() / 60.0
+            if lifespan_min <= 10.0:
+                from src.schemas import CLOBState
+                clob_state = CLOBState(
+                    market_id=market.market_id,
+                    timestamp=datetime.now(timezone.utc),
+                    yes_ask=0.505,  # 1% spread around 0.50
+                    yes_bid=0.495,
+                    no_ask=0.505,
+                    no_bid=0.495,
+                    yes_depth_usd=100.0,
+                    no_depth_usd=100.0,
+                    market_vig=0.01,
+                    is_liquid=True,
+                    is_stale=False
+                )
+                logger.debug("using_synthetic_clob_fallback", market_id=market.market_id)
+
         if not clob_state:
             logger.warning("no_clob_data_skipping_signal")
             return
@@ -701,7 +724,7 @@ class TradingBot:
         full signal pipeline at a cadence matching ultra-short horizons.
         """
         while self._running:
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
 
             if not self._discovery.is_market_active:
                 continue

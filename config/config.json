@@ -20,7 +20,8 @@
     "entry_window_long_max_minutes": 720.0,
     "probability_source": "fair",
     "hybrid_fair_weight": 0.7,
-    "hybrid_model_weight": 0.3
+    "hybrid_model_weight": 0.3,
+    "no_trade_deadband": 0.00
   },
   "clob": {
     "min_depth_usd": 10.0,

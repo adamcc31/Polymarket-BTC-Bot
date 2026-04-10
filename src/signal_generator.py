@@ -294,7 +294,12 @@ class SignalGenerator:
         # ── No-trade zone around fair (prevents churn) ─────────
         no_trade_zone_p = float(self._config.get("signal.no_trade_deadband", 0.02))
         mid_yes = (clob_state.yes_bid + clob_state.yes_ask) / 2.0
-        if abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
+        
+        # Bypass deadband for ultra-short markets – we WANT to trade at the money
+        lifespan_min = (active_market.T_resolution - active_market.T_open).total_seconds() / 60.0
+        is_ultrashort = lifespan_min <= 10.0
+        
+        if not is_ultrashort and abs(P_model - mid_yes) <= (no_trade_zone_p + u_used):
             logger.info(
                 "signal_abstain_no_trade_zone",
                 fair_prob=round(P_model, 4),
