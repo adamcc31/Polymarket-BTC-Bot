@@ -473,9 +473,6 @@ class MarketDiscovery:
                                 continue
     
                             # --- Patch T_open: use T_resolution − 5 min ---
-                            # The event-level startDate is the series creation date,
-                            # NOT the current 5-min window open time. Fix it here so
-                            # _parse_market's lifespan check does not reject the market.
                             end_date_str = (
                                 m.get("end_date_iso") or m.get("endDateIso") or m.get("endDate", "")
                             )
@@ -484,41 +481,55 @@ class MarketDiscovery:
                             if T_res is not None:
                                 synthetic_open = T_res - timedelta(minutes=5)
                                 iso_open = synthetic_open.isoformat()
-                                # Overwrite all possible startDate field names
                                 m_patched["startDateIso"] = iso_open
                                 m_patched["startDate"] = iso_open
                                 m_patched["createdAt"] = iso_open
 
-                            # --- OFFICIAL GAMMA STRIKE SYNC ---
-                            # Broaden the extraction keys
-                            official_strike_raw = (
-                                m.get("groupItemThreshold") or 
-                                m.get("initial_price") or 
-                                m.get("strike_price")
-                            )
-                            
-                            # Fallback to regex on the question text if keys are missing
-                            if not official_strike_raw or float(official_strike_raw) < 1000.0:
-                                q_text = m.get("question", "")
-                                match = re.search(r"\$([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)", q_text)
-                                if match:
-                                    official_strike_raw = match.group(1).replace(",", "")
-                                    
-                            if not official_strike_raw or float(official_strike_raw) < 1000.0:
-                                logger.debug("official_strike_pending", slug=slug, market_id=m.get("id"))
-                                continue
-                            
-                            # Success! Lock in the official strike
-                            m_patched = dict(m)
-                            if T_res is not None:
-                                synthetic_open = T_res - timedelta(minutes=5)
-                                iso_open = synthetic_open.isoformat()
-                                m_patched["startDateIso"] = iso_open
-                                m_patched["startDate"] = iso_open
-                                m_patched["createdAt"] = iso_open
+                            # --- VATIC ORACLE HYDRATION (from stable version) ---
+                            # Polymarket 5m markets do NOT reliably populate
+                            # groupItemThreshold / initial_price / strike_price.
+                            # The stable bot fetches the strike from the Vatic Oracle
+                            # and injects it into the patched market data BEFORE parsing.
+                            vatic_strike = await self.fetch_oracle_price(window_ts)
+                            if vatic_strike and vatic_strike > 1000.0:
+                                m_patched["groupItemThreshold"] = str(vatic_strike)
+                                m_patched["vatic_strike_injected"] = True
+                                logger.info("vatic_strike_injected", strike=vatic_strike, slug=slug)
+                            else:
+                                # Fallback: try reading from API fields or regex
+                                official_strike_raw = (
+                                    m.get("groupItemThreshold") or
+                                    m.get("initial_price") or
+                                    m.get("strike_price")
+                                )
+                                # Validate the raw value safely
+                                strike_valid = False
+                                if official_strike_raw is not None:
+                                    try:
+                                        if float(official_strike_raw) > 1000.0:
+                                            strike_valid = True
+                                    except (ValueError, TypeError):
+                                        pass
 
-                            logger.info("official_strike_locked", source="gamma_api", strike=official_strike_raw, slug=slug)
-                            
+                                if not strike_valid:
+                                    # Last resort: regex on question text
+                                    q_text = m.get("question", "")
+                                    match = re.search(r"\$([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)", q_text)
+                                    if match:
+                                        extracted = match.group(1).replace(",", "")
+                                        try:
+                                            if float(extracted) > 1000.0:
+                                                m_patched["groupItemThreshold"] = extracted
+                                                strike_valid = True
+                                        except (ValueError, TypeError):
+                                            pass
+
+                                if not strike_valid:
+                                    logger.debug("dynamic_strike_pending_all_sources",
+                                                 slug=slug, market_id=m.get("id"),
+                                                 question=m.get("question", "")[:60])
+                                    # Don't hard-skip — let _parse_market attempt its own extraction
+    
                             parsed = self._parse_market(m_patched)
                             if parsed is None:
                                 logger.info(
@@ -530,8 +541,6 @@ class MarketDiscovery:
                                 continue
 
                             # --- FILTER TIME-TO-RESOLUTION (TTR) ---
-                            # Be more permissive here; rely on execution.py and self._late_ttr
-                            # to block the actual trade if it's too risky.
                             if parsed.TTR_minutes < 1.5:
                                 logger.debug(
                                     "dynamic_5m_skipped_too_late", 
