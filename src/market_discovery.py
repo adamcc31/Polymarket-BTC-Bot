@@ -523,7 +523,14 @@ class MarketDiscovery:
                                 continue
     
                             if not parsed.clob_token_ids[0] or not parsed.clob_token_ids[1]:
-                                continue
+                                # ATTEMPT HYDRATION FALLBACK
+                                hydrated_ids, hydrated_labels = await self._hydrate_dynamic_market_tokens(client, parsed.market_id)
+                                if hydrated_ids[0] and hydrated_ids[1]:
+                                    parsed.clob_token_ids = hydrated_ids
+                                    parsed.outcomes = hydrated_labels
+                                else:
+                                    logger.warning("dynamic_5m_dropped_missing_tokens", market_id=parsed.market_id)
+                                    continue
     
                             # 5-min markets have negligible 24hr volume by design;
                             # use total volume (all-time) as the liquidity signal instead.
@@ -563,6 +570,30 @@ class MarketDiscovery:
                         logger.warning("dynamic_5m_event_parse_error", slug=slug, error=str(e))
 
         return candidates
+
+    async def _hydrate_dynamic_market_tokens(
+        self, client: httpx.AsyncClient, market_id: str
+    ) -> tuple[list[str], list[str]]:
+        """
+        Fetch full market metadata from Polymarket Gamma API to recover missing tokens.
+        The /events endpoint sometimes omits the full 'tokens' array.
+        """
+        try:
+            url = f"{self.GAMMA_API_BASE}/markets/{market_id}"
+            resp = await client.get(url, headers={"Accept": "application/json"})
+            if resp.is_success:
+                full_data = resp.json()
+                tokens = full_data.get("tokens", [])
+                ids, labels = self._extract_token_ids(tokens, full_data)
+                if ids[0] and ids[1]:
+                    logger.debug("dynamic_5m_tokens_hydrated", market_id=market_id, outcomes=labels)
+                    return ids, labels
+            else:
+                logger.warning("hydration_request_failed", market_id=market_id, status=resp.status_code)
+        except Exception as e:
+            logger.error("hydration_error", market_id=market_id, error=str(e))
+            
+        return ["", ""], ["YES", "NO"]
 
     async def _query_candidates(self) -> list[dict]:
         """
@@ -1104,12 +1135,17 @@ class MarketDiscovery:
                 if t_id:
                     ids[i] = t_id
 
-        # Fallback for older API versions
+        # Fallback for older API versions or stringified JSON payloads
         if not ids[0]:
-            clob_ids = market_data.get("clobTokenIds", [])
-            if isinstance(clob_ids, list) and len(clob_ids) >= 2:
-                ids[0] = clob_ids[0]
-                ids[1] = clob_ids[1]
+            clob_ids_raw = market_data.get("clobTokenIds")
+            if clob_ids_raw:
+                try:
+                    clob_ids = clob_ids_raw if isinstance(clob_ids_raw, list) else json.loads(clob_ids_raw)
+                    if isinstance(clob_ids, list) and len(clob_ids) >= 2:
+                        ids[0] = str(clob_ids[0])
+                        ids[1] = str(clob_ids[1])
+                except (json.JSONDecodeError, ValueError, IndexError):
+                    pass
 
         return ids, labels
 
