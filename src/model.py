@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import structlog
 
 from src.config_manager import ConfigManager
@@ -101,16 +102,19 @@ class ModelEnsemble:
         try:
             X = np.array(feature_vector).reshape(1, -1)
 
+            from src.feature_engine import FEATURE_NAMES
+            X_df = pd.DataFrame(X, columns=FEATURE_NAMES)
+
             # --- STAGE 1: Base Model Inference ---
             # LightGBM prediction
             if self._calibrator is not None:
-                lgbm_prob = self._calibrator.predict_proba(X)[0, 1]
+                lgbm_prob = self._calibrator.predict_proba(X_df)[0, 1]
             else:
-                lgbm_prob = self._lgbm_model.predict_proba(X)[0, 1]
+                lgbm_prob = self._lgbm_model.predict_proba(X_df)[0, 1]
 
             # LogReg prediction
             if self._logreg_model is not None and self._scaler is not None:
-                X_scaled = self._scaler.transform(X)
+                X_scaled = self._scaler.transform(X_df)
                 logreg_prob = self._logreg_model.predict_proba(X_scaled)[0, 1]
             else:
                 logreg_prob = lgbm_prob  # Fallback
@@ -137,6 +141,15 @@ class ModelEnsemble:
                 live_edge = raw_p - clob_ask
 
                 # Construct Meta-Feature Vector (matches retrain_meta_calibrator.py FEATURES)
+                # Note: using exact column names from training for feature-name consistency
+                META_FEATURES = [
+                    "distance_to_strike_bps", 
+                    "avg_TTR_minutes", 
+                    "avg_P_model", 
+                    "avg_live_edge", 
+                    "is_coinflip"
+                ]
+                
                 meta_X = np.array([
                     dist_bps,
                     metadata.TTR_minutes,
@@ -144,11 +157,13 @@ class ModelEnsemble:
                     live_edge,
                     is_coinflip
                 ]).reshape(1, -1)
+                
+                meta_X_df = pd.DataFrame(meta_X, columns=META_FEATURES)
 
                 # Meta-Ensemble Predictions
-                meta_lgbm_prob = self._meta_lgbm.predict(meta_X)[0]
+                meta_lgbm_prob = self._meta_lgbm.predict(meta_X_df)[0]
                 
-                meta_X_scaled = self._meta_scaler.transform(meta_X)
+                meta_X_scaled = self._meta_scaler.transform(meta_X_df)
                 meta_logreg_prob = self._meta_logreg.predict_proba(meta_X_scaled)[0, 1]
                 
                 meta_p = (0.7 * meta_lgbm_prob + 0.3 * meta_logreg_prob)
@@ -331,8 +346,11 @@ class ModelEnsemble:
             return None
 
         try:
-            lgbm_probs = self._lgbm_model.predict_proba(X)[:, 1]
-            X_scaled = self._scaler.transform(X)
+            from src.feature_engine import FEATURE_NAMES
+            X_df = pd.DataFrame(X, columns=FEATURE_NAMES)
+            
+            lgbm_probs = self._lgbm_model.predict_proba(X_df)[:, 1]
+            X_scaled = self._scaler.transform(X_df)
             logreg_probs = self._logreg_model.predict_proba(X_scaled)[:, 1]
             mae = float(np.mean(np.abs(lgbm_probs - logreg_probs)))
             return mae
