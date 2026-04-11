@@ -492,11 +492,14 @@ class MarketDiscovery:
                                 m_patched["startDate"] = iso_open
                                 m_patched["createdAt"] = iso_open
 
-                            # --- VATIC ORACLE HYDRATION ---
-                            # window_ts adalah tepat waktu awal epoch (timestamp)
-                            vatic_strike = await self.fetch_oracle_price(window_ts)
+                            # --- VATIC ORACLE HYDRATION (Bypass Gamma API Lag) ---
+                            # window_ts (Unix) is the RESOLUTION time of this market.
+                            # The Strike Price is the Oracle Price at the START of this window.
+                            target_start_ts = window_ts - window_seconds
+                            vatic_strike = await self.fetch_oracle_price(target_start_ts)
                             if vatic_strike:
                                 m_patched["groupItemThreshold"] = str(vatic_strike)
+                                logger.debug("dynamic_5m_pre_hydrated", slug=slug, strike=vatic_strike)
     
                             parsed = self._parse_market(m_patched)
                             if parsed is None:
@@ -785,8 +788,28 @@ class MarketDiscovery:
             if strike_price is None:
                 question_l = question.lower()
                 if is_dynamic_5m:
-                    # Not an unsupported market, just waiting for the API to lock the price!
-                    logger.info("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
+                    # OPTIMIZATION: Check Oracle Cache for Auto-Injection
+                    # Target start is T_resolution - (5, 15, or 60 min)
+                    delta_min = 5.0
+                    if "-15m" in slug.lower(): delta_min = 15.0
+                    elif "-1h" in slug.lower(): delta_min = 60.0
+                    
+                    target_start_ts = int(T_resolution.timestamp() - (delta_min * 60))
+                    cached_price = self._vatic_cache.get("price")
+                    cached_epoch = self._vatic_cache.get("epoch")
+                    
+                    if cached_epoch == target_start_ts and cached_price is not None:
+                        strike_price = cached_price
+                        logger.info(
+                            "strike_price_auto_injected",
+                            source="vatic_oracle_cache",
+                            price=strike_price,
+                            epoch=target_start_ts,
+                            market_id=market_id
+                        )
+                    else:
+                        # Not an unsupported market, just waiting for the API to lock the price!
+                        logger.info("dynamic_strike_pending", market_id=market_id, msg="Waiting for oracle price to beat")
                 elif "up or down" in question_l and "from $" not in question_l:
                     logger.info(
                         "unsupported_market_type_no_strike",
