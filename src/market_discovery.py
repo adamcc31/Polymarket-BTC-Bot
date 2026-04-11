@@ -511,9 +511,10 @@ class MarketDiscovery:
                                 )
                                 continue
 
-                            # --- FILTER TIME-TO-RESOLUTION (TTR) KETAT ---
-                            # Jangan pertimbangkan epoch yang sisa waktunya di bawah 4 menit
-                            if parsed.TTR_minutes < 4.0:
+                            # --- FILTER TIME-TO-RESOLUTION (TTR) ---
+                            # Be more permissive here; rely on execution.py and self._late_ttr
+                            # to block the actual trade if it's too risky.
+                            if parsed.TTR_minutes < 1.5:
                                 logger.debug(
                                     "dynamic_5m_skipped_too_late", 
                                     market_id=parsed.market_id, 
