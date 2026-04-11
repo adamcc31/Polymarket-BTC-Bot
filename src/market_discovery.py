@@ -518,7 +518,7 @@ class MarketDiscovery:
                                 )
                                 continue
     
-                            if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                            if not parsed.clob_token_ids[0] or not parsed.clob_token_ids[1]:
                                 continue
     
                             # 5-min markets have negligible 24hr volume by design;
@@ -633,7 +633,7 @@ class MarketDiscovery:
                     is_5m_target = "5 minute" in parsed.question.lower()
                     if is_5m_target or parsed.TTR_minutes >= self._min_ttr:
                         # Ensure CLOB tradability: must have YES/NO token IDs.
-                        if not parsed.clob_token_ids.get("YES") or not parsed.clob_token_ids.get("NO"):
+                        if not parsed.clob_token_ids[0] or not parsed.clob_token_ids[1]:
                             if len(skipped_reasons) < 5:
                                 skipped_reasons.append(f"Missing-Token-IDs: '{q[:50]}...'")
                             continue
