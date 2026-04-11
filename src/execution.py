@@ -163,15 +163,16 @@ class ExecutionClient:
         signal = approved_bet.signal
 
         # Determine token using agnostic mapping from ActiveMarket (Index 0/1 guaranteed)
-        token_key = "YES" if signal.signal == "BUY_YES" else "NO"
-        token_id = active_market.clob_token_ids.get(token_key, "")
-
-        if not token_id:
-            logger.error("missing_agnostic_token_id", token_key=token_key, market_id=active_market.market_id)
-            return OrderRejected(reason="MISSING_TOKEN_ID")
+        idx = 0 if signal.signal == "BUY_INDEX_0" else 1
+        try:
+            token_id = active_market.clob_token_ids[idx]
+            outcome_label = active_market.outcomes[idx].upper()
+        except (IndexError, TypeError):
+            logger.error("missing_agnostic_token_details", index=idx, market_id=active_market.market_id)
+            return OrderRejected(reason="MISSING_TOKEN_DETAILS")
 
         # ── Maker vs taker-like pricing ────────────────────────
-        if signal.signal == "BUY_YES":
+        if signal.signal == "BUY_INDEX_0":
             clob_ask = signal.clob_yes_ask
             clob_bid = signal.clob_yes_bid
             edge = signal.edge_yes
@@ -204,6 +205,7 @@ class ExecutionClient:
             logger.info(
                 "placing_live_order",
                 token_id=token_id[:16],
+                outcome=outcome_label,
                 price=order_price,
                 size=approved_bet.bet_size,
                 side="BUY",

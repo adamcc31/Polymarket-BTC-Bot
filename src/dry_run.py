@@ -134,7 +134,7 @@ class DryRunEngine:
             if entry_price_override is not None
             else (
                 signal.clob_yes_ask
-                if signal.signal == "BUY_YES"
+                if signal.signal == "BUY_INDEX_0"
                 else signal.clob_no_ask
             )
         )
@@ -174,10 +174,15 @@ class DryRunEngine:
 
         self._pending_trades.append(trade)
 
+        # Map index to actual outcome label for logging
+        idx = 0 if trade.signal_type == "BUY_INDEX_0" else 1
+        outcome_label = active_market.outcomes[idx].upper()
+
         logger.info(
             "paper_trade_opened",
             trade_id=trade.trade_id[:8],
             signal=trade.signal_type,
+            outcome=outcome_label,
             bet_size=round(trade.bet_size, 2),
             entry_price=round(entry_price, 4),
             P_model=round(signal.P_model, 4),
@@ -199,10 +204,13 @@ class DryRunEngine:
         This is label-agnostic and relies on the mathematical strike condition.
         """
         # Determine outcome
+        # Agnostic Win Condition:
+        # BUY_INDEX_0 (YES/UP) wins if BTC Price > Strike
+        # BUY_INDEX_1 (NO/DOWN) wins if BTC Price <= Strike
         won = (
-            (trade.signal_type == "BUY_YES" and btc_at_resolution > trade.strike_price)
+            (trade.signal_type == "BUY_INDEX_0" and btc_at_resolution > trade.strike_price)
             or
-            (trade.signal_type == "BUY_NO" and btc_at_resolution <= trade.strike_price)
+            (trade.signal_type == "BUY_INDEX_1" and btc_at_resolution <= trade.strike_price)
         )
 
         outcome = "WIN" if won else "LOSS"
@@ -296,8 +304,8 @@ class DryRunEngine:
         brier = self._compute_brier_score()
 
         # Mean edges
-        yes_trades = [t for t in trades if t.signal_type == "BUY_YES"]
-        no_trades = [t for t in trades if t.signal_type == "BUY_NO"]
+        yes_trades = [t for t in trades if t.signal_type == "BUY_INDEX_0"]
+        no_trades = [t for t in trades if t.signal_type == "BUY_INDEX_1"]
         mean_edge_yes = np.mean([t.edge_yes for t in yes_trades]) if yes_trades else 0.0
         mean_edge_no = np.mean([t.edge_no for t in no_trades]) if no_trades else 0.0
         mean_ttr = np.mean([t.TTR_at_entry for t in trades]) if trades else 0.0

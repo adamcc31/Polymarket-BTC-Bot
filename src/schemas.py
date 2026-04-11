@@ -63,8 +63,11 @@ class ActiveMarket(BaseModel):
             "Settlement price type derived from the exchange candle (e.g. 'close', 'vwap')."
         ),
     )
-    clob_token_ids: Dict[str, str] = Field(
-        ..., description='{"YES": "0x...", "NO": "0x..."}'
+    clob_token_ids: List[str] = Field(
+        ..., description='List of token IDs [Outcome 0, Outcome 1]'
+    )
+    outcomes: List[str] = Field(
+        default=["YES", "NO"], description='List of outcome labels [e.g. "Up", "Down"]'
     )
     resolution_source: Optional[str] = Field(
         default=None,
@@ -107,10 +110,10 @@ class CLOBState(BaseModel):
 # ============================================================
 
 class FeatureVector(BaseModel):
-    """24-feature vector output from feature engine."""
+    """22-feature vector output from feature engine (amputated OBI/TFM)."""
 
-    values: List[float] = Field(..., min_length=24, max_length=24)
-    feature_names: List[str] = Field(..., min_length=24, max_length=24)
+    values: List[float] = Field(..., min_length=22, max_length=22)
+    feature_names: List[str] = Field(..., min_length=22, max_length=22)
     metadata: FeatureMetadata
 
     class Config:
@@ -136,9 +139,9 @@ class FeatureMetadata(BaseModel):
 # ============================================================
 
 class SignalResult(BaseModel):
-    """Output of signal evaluation pipeline."""
+    """Output of signal evaluation pipeline (Agnostic Indexing)."""
 
-    signal: Literal["BUY_YES", "BUY_NO", "ABSTAIN"]
+    signal: Literal["BUY_INDEX_0", "BUY_INDEX_1", "ABSTAIN"]
     abstain_reason: Optional[
         Literal[
             "TTR_PHASE",
@@ -223,7 +226,7 @@ class PaperTrade(BaseModel):
     trade_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     session_id: str
     market_id: str
-    signal_type: Literal["BUY_YES", "BUY_NO"]
+    signal_type: Literal["BUY_INDEX_0", "BUY_INDEX_1"]
     entry_price: float
     bet_size: float
     strike_price: float

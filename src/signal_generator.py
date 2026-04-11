@@ -341,11 +341,11 @@ class SignalGenerator:
         # ── STEP 6: FINAL SIGNAL SELECTION ───────────────────
         if edge_yes > margin and edge_no > margin:
             # Both edges positive — pick larger
-            signal = "BUY_YES" if edge_yes >= edge_no else "BUY_NO"
+            signal = "BUY_INDEX_0" if edge_yes >= edge_no else "BUY_INDEX_1"
         elif edge_yes > margin:
-            signal = "BUY_YES"
+            signal = "BUY_INDEX_0"
         else:
-            signal = "BUY_NO"
+            signal = "BUY_INDEX_1"
 
         logger.info(
             "signal_generated",

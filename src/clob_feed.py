@@ -110,20 +110,21 @@ class CLOBFeed:
         self, market: ActiveMarket
     ) -> Optional[CLOBState]:
         """
-        Fetch CLOB orderbook for YES and NO tokens.
+        Fetch CLOB orderbook for Outcome 0 (YES/UP) and Outcome 1 (NO/DOWN).
         Returns CLOBState with best bid/ask, depth, vig, and liquidity flag.
         """
-        yes_token = market.clob_token_ids.get("YES", "")
-        no_token = market.clob_token_ids.get("NO", "")
-
-        if not yes_token or not no_token:
-            logger.warning("clob_missing_token_ids", market_id=market.market_id)
+        # Agnostic Indexing: Outcome 0 is always at index 0, Outcome 1 at index 1
+        try:
+            token_0 = market.clob_token_ids[0]
+            token_1 = market.clob_token_ids[1]
+        except (IndexError, TypeError):
+            logger.error("clob_missing_token_ids", market_id=market.market_id)
             return None
 
-        yes_book = await self._fetch_book(yes_token)
-        no_book = await self._fetch_book(no_token)
+        book_0 = await self._fetch_book(token_0)
+        book_1 = await self._fetch_book(token_1)
 
-        if not yes_book or not no_book:
+        if not book_0 or not book_1:
             # Use cached state if available, flag as potentially stale
             if self._cached_state:
                 self._cached_state = self._cached_state.model_copy(
@@ -139,34 +140,34 @@ class CLOBFeed:
             return None
 
         # Extract best bid/ask
-        yes_ask = self._best_ask(yes_book)
-        yes_bid = self._best_bid(yes_book)
-        no_ask = self._best_ask(no_book)
-        no_bid = self._best_bid(no_book)
+        ask_0 = self._best_ask(book_0)
+        bid_0 = self._best_bid(book_0)
+        ask_1 = self._best_ask(book_1)
+        bid_1 = self._best_bid(book_1)
 
         # Calculate depth within 3% of ask
-        yes_depth = self._calc_depth_near_ask(yes_book, yes_ask, pct=0.03)
-        no_depth = self._calc_depth_near_ask(no_book, no_ask, pct=0.03)
+        depth_0 = self._calc_depth_near_ask(book_0, ask_0, pct=0.03)
+        depth_1 = self._calc_depth_near_ask(book_1, ask_1, pct=0.03)
 
         # Market vig
-        vig = yes_ask + no_ask - 1.0
+        vig = ask_0 + ask_1 - 1.0
 
         # Liquidity check
         is_liquid = (
-            yes_depth >= self._min_depth_usd
-            and no_depth >= self._min_depth_usd
+            depth_0 >= self._min_depth_usd
+            and depth_1 >= self._min_depth_usd
             and vig <= self._max_vig
         )
 
         state = CLOBState(
             market_id=market.market_id,
             timestamp=datetime.now(timezone.utc),
-            yes_ask=yes_ask,
-            yes_bid=yes_bid,
-            no_ask=no_ask,
-            no_bid=no_bid,
-            yes_depth_usd=yes_depth,
-            no_depth_usd=no_depth,
+            yes_ask=ask_0,
+            yes_bid=bid_0,
+            no_ask=ask_1,
+            no_bid=bid_1,
+            yes_depth_usd=depth_0,
+            no_depth_usd=depth_1,
             market_vig=vig,
             is_liquid=is_liquid,
             is_stale=False,

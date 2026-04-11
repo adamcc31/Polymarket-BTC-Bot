@@ -449,10 +449,17 @@ class MarketDiscovery:
                             
                             payload = resp.json()
                             if isinstance(payload, dict):
-                                payload = payload.get("data", [payload])
-                            if not isinstance(payload, list) or not payload:
+                                event_list = payload.get("data", [])
+                                if not event_list and "id" in payload:
+                                    event = payload # Single object response
+                                elif event_list:
+                                    event = event_list[0]
+                                else:
+                                    continue
+                            elif isinstance(payload, list) and payload:
+                                event = payload[0]
+                            else:
                                 continue
-                            event = payload[0]
 
                         sub_markets: list[dict] = event.get("markets", [])
 
@@ -797,9 +804,9 @@ class MarketDiscovery:
             if strike_price is None:
                 return None
 
-            # Extract CLOB token IDs
+            # Extract CLOB token IDs and Outcome Labels (Agnostic Indexing)
             tokens = market_data.get("tokens", [])
-            clob_token_ids = self._extract_token_ids(tokens, market_data)
+            clob_token_ids, outcomes = self._extract_token_ids(tokens, market_data)
 
             (
                 settlement_exchange,
@@ -827,6 +834,7 @@ class MarketDiscovery:
                 T_resolution=T_resolution,
                 TTR_minutes=ttr_minutes,
                 clob_token_ids=clob_token_ids,
+                outcomes=outcomes,
                 settlement_exchange=settlement_exchange,
                 settlement_instrument=settlement_instrument,
                 settlement_granularity=settlement_granularity,
@@ -1048,20 +1056,20 @@ class MarketDiscovery:
         )
 
     @staticmethod
-    def _extract_token_ids(tokens: list, market_data: dict) -> dict:
+    def _extract_token_ids(tokens: list, market_data: dict) -> tuple[list[str], list[str]]:
         """
         Agnostic Index Mapping (Agnostic to Outcome Labels):
-        Binary markets on Polymarket consistently use Index 0 for the primary 
-        outcome (Yes/Up) and Index 1 for the inverse (No/Down).
+        Polymarket consistently uses Index 0 for the primary outcome (YES/UP)
+        and Index 1 for the inverse (NO/DOWN).
         """
-        token_ids = {"YES": "", "NO": ""}
+        ids = ["", ""]
+        labels = ["YES", "NO"]
 
         if isinstance(tokens, list) and len(tokens) >= 2:
-            # Map index 0 to YES/UP, index 1 to NO/DOWN
-            for i, key in enumerate(["YES", "NO"]):
+            for i in range(2):
                 token = tokens[i]
-                # Extract outcome label for logging only (agnostic execution)
                 label = str(token.get("outcome", "unknown")).upper()
+                labels[i] = label
                 
                 t_id = (
                     token.get("token_id")
@@ -1070,29 +1078,16 @@ class MarketDiscovery:
                     or ""
                 )
                 if t_id:
-                    token_ids[key] = t_id
-                    logger.debug(
-                        "token_mapped_by_index",
-                        index=i,
-                        internal_key=key,
-                        market_label=label,
-                        token_id=t_id[:16]
-                    )
+                    ids[i] = t_id
 
-        # Fallback for older API versions or edge cases
-        if not token_ids.get("YES"):
+        # Fallback for older API versions
+        if not ids[0]:
             clob_ids = market_data.get("clobTokenIds", [])
-            if isinstance(clob_ids, str):
-                try:
-                    import json
-                    clob_ids = json.loads(clob_ids)
-                except Exception:
-                    clob_ids = []
             if isinstance(clob_ids, list) and len(clob_ids) >= 2:
-                token_ids["YES"] = clob_ids[0]
-                token_ids["NO"] = clob_ids[1]
+                ids[0] = clob_ids[0]
+                ids[1] = clob_ids[1]
 
-        return token_ids
+        return ids, labels
 
     @staticmethod
     def _extract_settlement_descriptor(
