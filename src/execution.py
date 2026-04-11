@@ -190,7 +190,12 @@ class ExecutionClient:
         use_taker_like = edge >= taker_edge_threshold and spread > 0
 
         if use_taker_like:
-            order_price = round(clob_ask + taker_price_buffer, 4)
+            # Implement configurable slippage buffer on Taker / FAK orders
+            buffer_pct = float(self._config.get("execution.slippage_buffer_pct", 0.03))
+            raw_target = min(0.99, clob_ask * (1.0 + buffer_pct))
+            
+            # Clamp Price (Min 0.001, Max 0.99)
+            order_price = round(max(0.001, min(0.99, raw_target)), 4)
             exec_mode = "TAKER_LIKE"
         else:
             candidate = clob_bid + maker_price_step

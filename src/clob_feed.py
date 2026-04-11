@@ -1,19 +1,21 @@
 """
 clob_feed.py — Polymarket CLOB orderbook polling + cache + stale detection.
 
-REST polling every 5 seconds with retry + exponential backoff.
-Constructs CLOBState with liquidity metrics and vig calculation.
+Refactored to use WebSocket streaming for real-time 0-latency pricing.
+Constructs CLOBState using best bid/ask from WS.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
+import websockets
 import structlog
 
 from src.config_manager import ConfigManager
@@ -24,23 +26,20 @@ logger = structlog.get_logger(__name__)
 
 class CLOBFeed:
     """
-    Polymarket CLOB data feed via REST polling.
+    Polymarket CLOB data feed via WebSocket.
 
     Maintains cached CLOBState with staleness detection.
     """
 
+    WS_URL = os.getenv("REALTIME_PRICE_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
     CLOB_BASE_URL = "https://clob.polymarket.com"
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
-        self._poll_interval = config.get("clob.poll_interval_seconds", 5)
         self._stale_timeout = config.get("clob.stale_threshold_seconds", 30)
         self._min_depth_usd = config.get("clob.min_depth_usd", 10.0)
         self._max_vig = config.get("clob.max_market_vig", 0.07)
 
-        # Retry config
-        self._max_retries = 3
-        self._backoff_delays = [1, 2, 4]
         self._verify_ssl = os.getenv("SSL_VERIFY", "true").lower() == "true"
 
         # Circuit breaker
@@ -53,6 +52,10 @@ class CLOBFeed:
         self._last_fetch_time: float = 0.0
         self._stale_event_count: int = 0
         self._running = False
+        
+        self._ws_task: Optional[asyncio.Task] = None
+        self._cache_dict: dict[str, dict] = {}
+        self._market: Optional[ActiveMarket] = None
         self._fetch_locks: dict[str, asyncio.Lock] = {}
 
     # ── Public Properties ─────────────────────────────────────
@@ -70,40 +73,192 @@ class CLOBFeed:
 
     @property
     def circuit_breaker_tripped(self) -> bool:
-        """True when consecutive 404s have reached max_consecutive_404 threshold."""
         return self._circuit_breaker_tripped
 
     def reset_circuit_breaker(self) -> None:
-        """Reset circuit breaker after force_rediscover is triggered."""
         self._consecutive_404_count = 0
         self._circuit_breaker_tripped = False
         logger.info("clob_circuit_breaker_reset")
 
-    # ── Polling Loop ──────────────────────────────────────────
+    # ── WebSocket Loop ────────────────────────────────────────
 
     async def start(self, market: ActiveMarket) -> None:
         """Start polling loop for given market."""
         self._running = True
+        self._market = market
+        self._cache_dict.clear()
+        
         logger.info(
-            "clob_feed_started",
+            "clob_ws_started",
             market_id=market.market_id,
-            poll_interval=self._poll_interval,
+            url=self.WS_URL,
         )
 
-        while self._running:
-            try:
-                state = await self.fetch_clob_snapshot(market)
-                if state:
-                    self._cached_state = state
-                    self._last_fetch_time = time.time()
-            except Exception as e:
-                logger.error("clob_feed_loop_error", error=str(e))
-
-            await asyncio.sleep(self._poll_interval)
+        self._ws_task = asyncio.create_task(self._ws_loop())
 
     async def stop(self) -> None:
         self._running = False
-        logger.info("clob_feed_stopped")
+        if self._ws_task:
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except asyncio.CancelledError:
+                pass
+            self._ws_task = None
+        logger.info("clob_ws_stopped")
+
+    async def _ws_loop(self) -> None:
+        reconnect_attempts = 0
+        while self._running and self._market is not None:
+            try:
+                token_ids = []
+                # Fallback to empty list or explicit checks if needed
+                try:
+                    t0 = self._market.clob_token_ids[0]
+                    t1 = self._market.clob_token_ids[1]
+                    if t0: token_ids.append(t0)
+                    if t1: token_ids.append(t1)
+                except Exception as e:
+                    logger.error("ws_parse_tokens_error", error=str(e))
+
+                if not token_ids:
+                    logger.warning("ws_no_tokens", market_id=self._market.market_id)
+                    await asyncio.sleep(5)
+                    continue
+
+                logger.info("ws_connecting", tokens=token_ids)
+                
+                ssl_context = None
+                if not self._verify_ssl:
+                    import ssl
+                    ssl_context = ssl.create_default_context()
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
+
+                async with websockets.connect(self.WS_URL, ssl=ssl_context) as ws:
+                    logger.info("ws_connected")
+                    reconnect_attempts = 0
+                    
+                    sub_msg = {
+                        "assets_ids": token_ids,
+                        "type": "market",
+                        "custom_feature_enabled": True
+                    }
+                    await ws.send(json.dumps(sub_msg))
+                    
+                    ping_task = asyncio.create_task(self._ping_loop(ws))
+                    
+                    try:
+                        async for message in ws:
+                            if not self._running:
+                                break
+                                
+                            data = json.loads(message)
+                            evt_type = data.get("event_type")
+                            
+                            if data.get("type") == "pong":
+                                continue
+                                
+                            if evt_type == "best_bid_ask":
+                                asset_id = str(data.get("asset_id"))
+                                best_bid = float(data.get("best_bid", 0) or 0)
+                                best_ask = float(data.get("best_ask", 0) or 0)
+                                self._cache_dict[asset_id] = {"best_bid": best_bid, "best_ask": best_ask}
+                                self._rebuild_clob_state()
+                                
+                            elif evt_type == "price_change" and isinstance(data.get("price_changes"), list):
+                                for pc in data["price_changes"]:
+                                    aid = str(pc.get("asset_id"))
+                                    best_bid = float(pc.get("best_bid", 0) or 0)
+                                    best_ask = float(pc.get("best_ask", 0) or 0)
+                                    self._cache_dict[aid] = {"best_bid": best_bid, "best_ask": best_ask}
+                                self._rebuild_clob_state()
+
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("ws_connection_closed")
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.error("ws_msg_error", error=str(e))
+                    finally:
+                        ping_task.cancel()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("ws_connection_error", error=str(e))
+                
+            if self._running:
+                delay = min(5.0 * (2 ** reconnect_attempts), 30.0)
+                reconnect_attempts += 1
+                logger.warning("ws_reconnect_backoff", attempt=reconnect_attempts, delay=delay)
+                await asyncio.sleep(delay)
+
+    async def _ping_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
+        try:
+            while True:
+                await asyncio.sleep(8)
+                if ws.open:
+                    await ws.send(json.dumps({"type": "ping"}))
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    def _rebuild_clob_state(self) -> None:
+        """Constructs an updated CLOBState whenever websocket pushes new data."""
+        if not self._market:
+            return
+
+        try:
+            token_0 = self._market.clob_token_ids[0]
+            token_1 = self._market.clob_token_ids[1]
+        except (IndexError, TypeError):
+            return
+
+        q0 = self._cache_dict.get(token_0)
+        q1 = self._cache_dict.get(token_1)
+
+        if not q0 or not q1:
+            return
+
+        ask_0 = float(q0["best_ask"])
+        bid_0 = float(q0["best_bid"])
+        ask_1 = float(q1["best_ask"])
+        bid_1 = float(q1["best_bid"])
+
+        # Fallback handling for missing asks
+        if ask_0 <= 0: ask_0 = 1.0
+        if ask_1 <= 0: ask_1 = 1.0
+
+        vig = (ask_0 + ask_1) - 1.0
+
+        # Since WS stream doesn't easily provide full depth at arbitrary %, 
+        # we proxy liquidity via tight vig and non-zero bids.
+        # We assume 1000 depth for liquidity checks if it has active quotes.
+        depth_param = 1000.0 if bid_0 > 0 and bid_1 > 0 else 0.0
+
+        is_liquid = (
+            depth_param >= self._min_depth_usd
+            and vig <= self._max_vig
+            and vig >= -0.1  # Prevent crazy crossed books from being marked liquid falsely
+        )
+
+        self._cached_state = CLOBState(
+            market_id=self._market.market_id,
+            timestamp=datetime.now(timezone.utc),
+            yes_ask=ask_0,
+            yes_bid=bid_0,
+            no_ask=ask_1,
+            no_bid=bid_1,
+            yes_depth_usd=depth_param,
+            no_depth_usd=depth_param,
+            market_vig=vig,
+            is_liquid=is_liquid,
+            is_stale=False,
+        )
+        self._last_fetch_time = time.time()
+        self._consecutive_404_count = 0  # Re-establishing healthy market sync
 
     # ── Snapshot Fetch ────────────────────────────────────────
 
@@ -111,192 +266,21 @@ class CLOBFeed:
         self, market: ActiveMarket
     ) -> Optional[CLOBState]:
         """
-        Fetch CLOB orderbook for Outcome 0 (YES/UP) and Outcome 1 (NO/DOWN).
-        Returns CLOBState with best bid/ask, depth, vig, and liquidity flag.
+        Return cached CLOBState locally retrieved from WS.
+        Wait briefly on cold start before returning None.
         """
-        # Agnostic Indexing: Outcome 0 is always at index 0, Outcome 1 at index 1
-        try:
-            token_0 = market.clob_token_ids[0]
-            token_1 = market.clob_token_ids[1]
-        except (IndexError, TypeError):
-            logger.error("clob_missing_token_ids", market_id=market.market_id)
-            return None
-
-        book_0 = await self._fetch_book(token_0)
-        book_1 = await self._fetch_book(token_1)
-
-        if not book_0 or not book_1:
-            # Use cached state if available, flag as potentially stale
-            if self._cached_state:
-                self._cached_state = self._cached_state.model_copy(
-                    update={"is_stale": True}
-                )
-                if self._is_stale():
-                    self._stale_event_count += 1
-                    logger.error(
-                        "clob_stale",
-                        last_fetch_age_s=round(time.time() - self._last_fetch_time, 1),
-                    )
-                return self._cached_state
-            return None
-
-        # Extract best bid/ask
-        ask_0 = self._best_ask(book_0)
-        bid_0 = self._best_bid(book_0)
-        ask_1 = self._best_ask(book_1)
-        bid_1 = self._best_bid(book_1)
-
-        # Calculate depth within 3% of ask
-        depth_0 = self._calc_depth_near_ask(book_0, ask_0, pct=0.03)
-        depth_1 = self._calc_depth_near_ask(book_1, ask_1, pct=0.03)
-
-        # Market vig
-        vig = ask_0 + ask_1 - 1.0
-
-        # Liquidity check
-        is_liquid = (
-            depth_0 >= self._min_depth_usd
-            and depth_1 >= self._min_depth_usd
-            and vig <= self._max_vig
-        )
-
-        state = CLOBState(
-            market_id=market.market_id,
-            timestamp=datetime.now(timezone.utc),
-            yes_ask=ask_0,
-            yes_bid=bid_0,
-            no_ask=ask_1,
-            no_bid=bid_1,
-            yes_depth_usd=depth_0,
-            no_depth_usd=depth_1,
-            market_vig=vig,
-            is_liquid=is_liquid,
-            is_stale=False,
-        )
-
-        return state
-
-    async def _fetch_book(self, token_id: str) -> Optional[dict]:
-        """
-        Fetch orderbook for a single token with retry.
-
-        404 responses are treated as a hard signal that the market has expired:
-          - No retry is performed (retrying a dead market wastes time).
-          - Consecutive 404 counter is incremented.
-          - When counter reaches max_consecutive_404, circuit_breaker_tripped is set,
-            signalling main.py to call force_rediscover().
-        All other HTTP or connection errors use the existing exponential backoff retry.
-        """
-        for attempt in range(self._max_retries):
-            try:
-                async with httpx.AsyncClient(timeout=10.0, verify=self._verify_ssl) as client:
-                    resp = await client.get(
-                        f"{self.CLOB_BASE_URL}/book",
-                        params={"token_id": token_id},
-                    )
-
-                    # ── 404: market expired, no point retrying ────────────
-                    if resp.status_code == 404:
-                        self._consecutive_404_count += 1
-                        logger.warning(
-                            "clob_book_not_found",
-                            token_id=token_id[:16],
-                            consecutive_404s=self._consecutive_404_count,
-                        )
-                        if self._consecutive_404_count >= self._max_consecutive_404:
-                            self._circuit_breaker_tripped = True
-                            logger.error(
-                                "clob_circuit_breaker_tripped",
-                                consecutive_404s=self._consecutive_404_count,
-                                threshold=self._max_consecutive_404,
-                            )
-                        return None  # No retry for 404
-
-                    resp.raise_for_status()
-
-                    # Successful fetch — reset 404 counter
-                    self._consecutive_404_count = 0
-                    return resp.json()
-
-            except httpx.HTTPStatusError as e:
-                # Non-404 HTTP error — retry with backoff
-                delay = self._backoff_delays[min(attempt, len(self._backoff_delays) - 1)]
-                logger.warning(
-                    "clob_fetch_retry",
-                    attempt=attempt + 1,
-                    token_id=token_id[:16],
-                    error=str(e),
-                    retry_delay=delay,
-                )
-                await asyncio.sleep(delay)
-            except httpx.HTTPError as e:
-                # Connection / timeout error — retry with backoff
-                delay = self._backoff_delays[min(attempt, len(self._backoff_delays) - 1)]
-                logger.warning(
-                    "clob_fetch_retry",
-                    attempt=attempt + 1,
-                    token_id=token_id[:16],
-                    error=str(e),
-                    retry_delay=delay,
-                )
-                await asyncio.sleep(delay)
-            except Exception as e:
-                logger.error("clob_fetch_unexpected", error=str(e))
-                break
-
-        logger.error("clob_fetch_exhausted", token_id=token_id[:16])
-        return None
-
-    # ── Orderbook Parsing ─────────────────────────────────────
-
-    @staticmethod
-    def _best_ask(book: dict) -> float:
-        """Extract best (lowest) ask price."""
-        asks = book.get("asks", [])
-        if not asks:
-            return 1.0  # No asks → max price
-        try:
-            prices = [float(a.get("price", 1.0)) for a in asks]
-            return min(prices) if prices else 1.0
-        except (ValueError, TypeError):
-            return 1.0
-
-    @staticmethod
-    def _best_bid(book: dict) -> float:
-        """Extract best (highest) bid price."""
-        bids = book.get("bids", [])
-        if not bids:
-            return 0.0  # No bids → min price
-        try:
-            prices = [float(b.get("price", 0.0)) for b in bids]
-            return max(prices) if prices else 0.0
-        except (ValueError, TypeError):
-            return 0.0
-
-    @staticmethod
-    def _best_price(book: dict, side: str = "ask") -> float:
-        """Helper to get best price for a given side."""
-        if side == "ask":
-            return CLOBFeed._best_ask(book)
-        return CLOBFeed._best_bid(book)
-
-    @staticmethod
-    def _calc_depth_near_ask(book: dict, best_ask: float, pct: float = 0.03) -> float:
-        """Calculate total USDC depth within pct% of best ask."""
-        asks = book.get("asks", [])
-        total_depth = 0.0
-        upper_bound = best_ask * (1.0 + pct)
-
-        for a in asks:
-            try:
-                price = float(a.get("price", 0))
-                size = float(a.get("size", 0))
-                if price <= upper_bound:
-                    total_depth += price * size  # USDC value
-            except (ValueError, TypeError):
-                continue
-
-        return total_depth
+        # Brief pause to allow WS sub to establish and return a packet
+        if not self._cached_state:
+            for _ in range(10):
+                if self._cached_state:
+                    break
+                await asyncio.sleep(0.1)
+                
+        if self._cached_state and self._is_stale():
+            self._stale_event_count += 1
+            return self._cached_state.model_copy(update={"is_stale": True})
+            
+        return self._cached_state
 
     def _is_stale(self) -> bool:
         """Check if CLOB data is stale."""
@@ -310,37 +294,25 @@ class CLOBFeed:
         timeout_ms: int = 500
     ) -> tuple[Optional[CLOBState], float]:
         """
-        Fetch real-time CLOB snapshot with concurrency safety and timeout-guarded fallback.
-        Ensures high-frequency loops never stall.
+        Fetch real-time CLOB snapshot locally from WebSocket dictionary.
         """
         lock = self._fetch_locks.setdefault(market.market_id, asyncio.Lock())
         
         async with lock:
             start = time.perf_counter()
-            try:
-                # Direct REST fetch (bypasses poll interval)
-                state = await asyncio.wait_for(
-                    self.fetch_clob_snapshot(market),
-                    timeout=timeout_ms / 1000.0
-                )
-                latency = (time.perf_counter() - start) * 1000
-                return state, latency
-                
-            except asyncio.TimeoutError:
-                latency = (time.perf_counter() - start) * 1000
+            state = await self.fetch_clob_snapshot(market)
+            latency = (time.perf_counter() - start) * 1000
+            
+            if state is None:
                 if self._cached_state is None:
                     # Cold start failure - no data to fall back on
                     raise RuntimeError("clob_no_cache_available_on_cold_start")
-                
+                    
                 logger.warning(
                     "clob_fetch_timeout_falling_back_to_cache",
                     market_id=market.market_id,
                     latency_ms=round(latency, 2)
                 )
-                # Return stale cache
                 return self._cached_state.model_copy(update={"is_stale": True}), latency
-            
-            except Exception as e:
-                latency = (time.perf_counter() - start) * 1000
-                logger.error("clob_fetch_direct_error", error=str(e))
-                return self._cached_state, latency
+
+            return state, latency

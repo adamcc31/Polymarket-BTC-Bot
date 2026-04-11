@@ -178,7 +178,7 @@ class MarketDiscovery:
             )
         else:
             # Cegah transisi ke WAITING jika kita menjalankan strategi 5m dynamic
-            has_dynamic_targets = bool(self._config.get("market_discovery.dynamic_5m_event_slugs", ["btc-updown-5m"]))
+            has_dynamic_targets = bool(self._config.get("market_discovery.dynamic_5m_event_slugs") or ["btc-updown-5m"])
             if has_dynamic_targets:
                 # Tetap di SEARCHING mode, stalking oracle price
                 logger.debug("dynamic_market_stalking", msg="Staying in SEARCHING state to monitor Oracle")
@@ -818,6 +818,18 @@ class MarketDiscovery:
                     market_data.get("initial_price") or 
                     market_data.get("strike_price")
                 )
+                
+                # Check regex if API fields are missing or invalid
+                try:
+                    if not raw_target or float(raw_target) < 1000.0:
+                        match = re.search(r"\$([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)", question)
+                        if match:
+                            raw_target = match.group(1).replace(",", "")
+                except (ValueError, TypeError):
+                    match = re.search(r"\$([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)", question)
+                    if match:
+                        raw_target = match.group(1).replace(",", "")
+
                 if raw_target is not None:
                     try:
                         extracted = float(raw_target)
