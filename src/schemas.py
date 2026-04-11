@@ -246,7 +246,9 @@ class PaperTrade(BaseModel):
 
     # Filled post-resolution
     btc_at_resolution: Optional[float] = None
+    status: Literal["PENDING", "DEFERRED", "ABANDONED"] = "PENDING"
     outcome: Optional[Literal["WIN", "LOSS", "PENDING"]] = "PENDING"
+    deferred_count: int = 0
     pnl_usd: Optional[float] = None
     pnl_pct_capital: Optional[float] = None
     capital_after: Optional[float] = None

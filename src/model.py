@@ -54,6 +54,7 @@ class ModelEnsemble:
         
         # --- Base Model (24 features) ---
         self._lgbm_model = None
+        self._lgbm_infer_path = "sklearn"  # Standard (Default)
         self._logreg_model = None
         self._scaler = None
         self._calibrator = None
@@ -110,7 +111,11 @@ class ModelEnsemble:
             if self._calibrator is not None:
                 lgbm_prob = self._calibrator.predict_proba(X_df)[0, 1]
             else:
-                lgbm_prob = self._lgbm_model.predict_proba(X_df)[0, 1]
+                if self._lgbm_infer_path == "sklearn":
+                    lgbm_prob = self._lgbm_model.predict_proba(X_df)[0, 1]
+                else:
+                    # Native Booster returns 1D array of probabilities directly
+                    lgbm_prob = self._lgbm_model.predict(X_df)[0]
 
             # LogReg prediction
             if self._logreg_model is not None and self._scaler is not None:
@@ -247,6 +252,14 @@ class ModelEnsemble:
 
             with open(lgbm_path, "rb") as f:
                 self._lgbm_model = pickle.load(f)
+                
+            # --- PHASE 1: Artifact Type Detection ---
+            if hasattr(self._lgbm_model, 'predict_proba'):
+                self._lgbm_infer_path = "sklearn"
+            else:
+                self._lgbm_infer_path = "native"
+                
+            logger.info("model_artifact_detected", type=self._lgbm_infer_path, version=version)
 
             if logreg_path.exists():
                 with open(logreg_path, "rb") as f:

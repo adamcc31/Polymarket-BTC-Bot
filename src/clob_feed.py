@@ -53,6 +53,7 @@ class CLOBFeed:
         self._last_fetch_time: float = 0.0
         self._stale_event_count: int = 0
         self._running = False
+        self._fetch_locks: dict[str, asyncio.Lock] = {}
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -273,6 +274,13 @@ class CLOBFeed:
             return 0.0
 
     @staticmethod
+    def _best_price(book: dict, side: str = "ask") -> float:
+        """Helper to get best price for a given side."""
+        if side == "ask":
+            return CLOBFeed._best_ask(book)
+        return CLOBFeed._best_bid(book)
+
+    @staticmethod
     def _calc_depth_near_ask(book: dict, best_ask: float, pct: float = 0.03) -> float:
         """Calculate total USDC depth within pct% of best ask."""
         asks = book.get("asks", [])
@@ -295,3 +303,44 @@ class CLOBFeed:
         if self._last_fetch_time == 0.0:
             return True
         return (time.time() - self._last_fetch_time) > self._stale_timeout
+
+    async def fetch_clob_snapshot_with_fallback(
+        self, 
+        market: ActiveMarket, 
+        timeout_ms: int = 500
+    ) -> tuple[Optional[CLOBState], float]:
+        """
+        Fetch real-time CLOB snapshot with concurrency safety and timeout-guarded fallback.
+        Ensures high-frequency loops never stall.
+        """
+        lock = self._fetch_locks.setdefault(market.market_id, asyncio.Lock())
+        
+        async with lock:
+            start = time.perf_counter()
+            try:
+                # Direct REST fetch (bypasses poll interval)
+                state = await asyncio.wait_for(
+                    self.fetch_clob_snapshot(market),
+                    timeout=timeout_ms / 1000.0
+                )
+                latency = (time.perf_counter() - start) * 1000
+                return state, latency
+                
+            except asyncio.TimeoutError:
+                latency = (time.perf_counter() - start) * 1000
+                if self._cached_state is None:
+                    # Cold start failure - no data to fall back on
+                    raise RuntimeError("clob_no_cache_available_on_cold_start")
+                
+                logger.warning(
+                    "clob_fetch_timeout_falling_back_to_cache",
+                    market_id=market.market_id,
+                    latency_ms=round(latency, 2)
+                )
+                # Return stale cache
+                return self._cached_state.model_copy(update={"is_stale": True}), latency
+            
+            except Exception as e:
+                latency = (time.perf_counter() - start) * 1000
+                logger.error("clob_fetch_direct_error", error=str(e))
+                return self._cached_state, latency

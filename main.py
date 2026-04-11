@@ -318,6 +318,28 @@ class TradingBot:
         # Register bar close callback
         self._binance.set_on_bar_close(self._on_bar_close)
 
+        # --- PHASE 3: COLD START CLOB GUARD ---
+        # Ensure at least one successful discovery before guarding CLOB
+        for _ in range(10):  # Wait up to 10s for initial discovery
+            market = self._discovery.active_market
+            if market:
+                break
+            await asyncio.sleep(1)
+            
+        market = self._discovery.active_market
+        if market:
+            try:
+                # First fetch must succeed or have a valid cache (impossible on cold start)
+                await self._clob.fetch_clob_snapshot_with_fallback(market, timeout_ms=2000) # Give 2s for boot
+                logger.info("clob_cold_start_passed", market_id=market.market_id)
+            except RuntimeError as e:
+                if "cold_start" in str(e):
+                    logger.critical("clob_cold_start_failed", market_id=market.market_id)
+                    raise SystemExit("Aborting: no CLOB data available at startup.")
+                raise
+        else:
+            logger.warning("clob_boot_guard_skipped_no_market")
+
         # Start concurrent tasks
         tasks = [
             asyncio.create_task(self._binance.start(), name="binance_feed"),
@@ -450,7 +472,19 @@ class TradingBot:
             logger.warning("binance_data_stale_skipping_signal")
             return
 
-        clob_state = self._clob.clob_state
+        # --- PHASE 3: REAL-TIME CLOB FETCH ---
+        # Replace static cache read with timeout-guarded fresh fetch
+        clob_state, clob_latency = await self._clob.fetch_clob_snapshot_with_fallback(market, timeout_ms=500)
+        
+        # Log comparison for "Phantom Pricing" audit
+        gamma_prob = getattr(market, "yes_prob", 0.0) # From discovery (Gamma)
+        logger.debug(
+            "price_sync_check",
+            market_id=market.market_id,
+            gamma_cached_prob=round(gamma_prob, 4),
+            clob_live_prob=round(clob_state.yes_ask, 4) if clob_state else None,
+            clob_fetch_latency_ms=round(clob_latency, 2)
+        )
         
         # ── Synthetic CLOB Fallback for Ultra-Short Markets ──
         # Market discovery identifies dynamic 5m markets. If they have no book depth
@@ -486,7 +520,6 @@ class TradingBot:
         if fv is None:
             return
 
-        # ── Fair Probability Computation ──────────────────────
         fair = self._fair_prob_engine.compute(
             binance_feed=self._binance,
             active_market=market,
@@ -724,36 +757,44 @@ class TradingBot:
         )
 
     async def _schedule_resolution(self, trade, market) -> None:
-        """Wait for market resolution and settle trade."""
+        """Wait for market resolution and settle trade strictly via Oracle."""
         now = datetime.now(timezone.utc)
         wait_seconds = (market.T_resolution - now).total_seconds()
 
         if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds + 5)  # +5s buffer for price settlement
+            await asyncio.sleep(wait_seconds + 5)  # +5s buffer for initial settlement
 
-        # ── RESOLUTION PRICE ACQUISITION (ORACLE FIRST) ─────────
-        # Priority 1: Vatic Oracle (Official Settlement Price for 5m markets)
-        price = await self._discovery.fetch_oracle_price(market.T_resolution)
-        
-        if price is not None:
-            logger.info("resolution_price_oracle_acquired", market_id=market.market_id, price=price)
-        else:
-            # Priority 2: Binance 1m Settlement (Consistent Fallback)
-            logger.warning("resolution_oracle_failed_falling_back_to_binance", market_id=market.market_id)
-            price = await self._binance.get_1m_settlement_price(
-                resolution_time=market.T_resolution,
-                price_type=(market.settlement_price_type or "close"),
-            )
+        # --- ABSOLUTE ORACLE ENFORCEMENT LOOP ---
+        price = None
+        while price is None:
+            # Check if trade was abandoned while we were waiting
+            if trade.status == "ABANDONED":
+                return
+
+            price = await self._discovery.fetch_oracle_price(market.T_resolution)
             
+            if price is not None:
+                logger.info("resolution_price_oracle_acquired", market_id=market.market_id, price=price)
+                break
+            
+            # Defer and retry
+            self._dry_run.defer_trade(trade.trade_id)
+            if trade.status == "ABANDONED":
+                return
+                
+            logger.info("resolution_oracle_missing_retrying_in_300s", trade_id=trade.trade_id[:8])
+            await asyncio.sleep(300) # Wait 5 minutes between resolution attempts
+
+        # At this point, price MUST be from Oracle. 
+        # Safety check: if somehow price is None here, something is structurally wrong.
         if price is None:
-            # Priority 3: Last observed price (Final Failsafe)
-            price = self._binance.latest_price
-            logger.warning("resolution_final_fallback_used", market_id=market.market_id, price=price)
+            logger.critical("oracle_resolution_failed_critically", trade_id=trade.trade_id)
+            return
 
         resolved = await self._dry_run.resolve_trade(trade, price)
         await self._risk_mgr.on_trade_resolved(resolved.pnl_usd or 0)
 
-        # Telegram: trade resolved (PnL final for this paper/live record).
+        # Telegram: trade resolved
         asyncio.create_task(
             self._send_telegram(
                 "ORDER RESULT",

@@ -236,6 +236,7 @@ class DryRunEngine:
         # Update trade
         resolved = trade.model_copy(update={
             "btc_at_resolution": btc_at_resolution,
+            "status": "RESOLVED",
             "outcome": outcome,
             "pnl_usd": round(pnl, 4),
             "pnl_pct_capital": round(pnl / (trade.capital_before + 1e-8) * 100, 2),
@@ -269,6 +270,35 @@ class DryRunEngine:
         )
 
         return resolved
+
+    def defer_trade(self, trade_id: str) -> Optional[PaperTrade]:
+        """
+        Transition a trade to DEFERRED status or ABANDONED if retry limit exceeded.
+        Enforces PENDING -> DEFERRED -> ABANDONED state machine.
+        """
+        for i, t in enumerate(self._pending_trades):
+            if t.trade_id == trade_id:
+                t.deferred_count += 1
+                if t.deferred_count > 12:  # 12 Retries = ~1 Hour of waiting
+                    t.status = "ABANDONED"
+                    logger.error(
+                        "trade_abandoned_no_oracle", 
+                        trade_id=t.trade_id[:8], 
+                        deferred_count=t.deferred_count,
+                        market_id=t.market_id
+                    )
+                    # Keep in pending list or move to a separate 'abandoned' list?
+                    # For now, keep it so it shows up in dashboard as ABANDONED.
+                else:
+                    t.status = "DEFERRED"
+                    logger.info(
+                        "paper_trade_deferred",
+                        trade_id=t.trade_id[:8],
+                        count=t.deferred_count,
+                        market_id=t.market_id
+                    )
+                return t
+        return None
 
     def increment_bars(self) -> None:
         """Count a processed bar."""
