@@ -486,6 +486,34 @@ class TradingBot:
             clob_fetch_latency_ms=round(clob_latency, 2)
         )
         
+        # --- STRIKE PRICE DRIFT AUDIT ---
+        # Verify the strike price matches the Oracle price at window start
+        is_5m = "5m" in (market.slug or "").lower()
+        if is_5m:
+            try:
+                # Strike for Market [T-5, T] is Oracle price at T-5
+                window_seconds = 300
+                if "-15m" in (market.slug or "").lower(): window_seconds = 900
+                elif "-1h" in (market.slug or "").lower(): window_seconds = 3600
+                
+                start_ts = market.T_resolution - timedelta(seconds=window_seconds)
+                oracle_strike = await self._discovery.fetch_oracle_price(start_ts)
+                
+                if oracle_strike is not None:
+                    drift = abs(market.strike_price - oracle_strike)
+                    logger.info(
+                        "strike_drift_check",
+                        market_id=market.market_id,
+                        strike_discovered=market.strike_price,
+                        strike_oracle=oracle_strike,
+                        drift=round(drift, 4),
+                        epoch=int(start_ts.timestamp())
+                    )
+                    if drift > 0.01:
+                        logger.warning("strike_drift_detected", drift=drift, market_id=market.market_id)
+            except Exception as e:
+                logger.error("strike_drift_audit_failed", error=str(e))
+        
         # ── Synthetic CLOB Fallback for Ultra-Short Markets ──
         # Market discovery identifies dynamic 5m markets. If they have no book depth
         # (common in first 60s), we inject a tight synthetic 50/50 book.

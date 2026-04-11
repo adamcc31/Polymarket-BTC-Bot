@@ -498,8 +498,10 @@ class MarketDiscovery:
                             target_start_ts = window_ts - window_seconds
                             vatic_strike = await self.fetch_oracle_price(target_start_ts)
                             if vatic_strike:
+                                # Ensure it's passed as a precise string to bypass Gamma schema parsing
                                 m_patched["groupItemThreshold"] = str(vatic_strike)
-                                logger.debug("dynamic_5m_pre_hydrated", slug=slug, strike=vatic_strike)
+                                m_patched["vatic_strike_injected"] = True
+                                logger.debug("dynamic_5m_vatic_strike_injected", slug=slug, strike=vatic_strike, epoch=target_start_ts)
     
                             parsed = self._parse_market(m_patched)
                             if parsed is None:
@@ -803,6 +805,8 @@ class MarketDiscovery:
                         # Ensure it's populated and not exactly 0 (which may happen precisely at 00:00 before oracle update)
                         if extracted > 1000.0: 
                             strike_price = extracted
+                            if market_data.get("vatic_strike_injected"):
+                                logger.info("strike_price_selected_source", source="vatic_oracle_injection", price=strike_price, market_id=market_id)
                     except (ValueError, TypeError):
                         pass
 
@@ -1044,6 +1048,11 @@ class MarketDiscovery:
                 epoch_ts = epoch_ts.replace(tzinfo=timezone.utc)
             epoch_ts = int(epoch_ts.timestamp())
 
+        # --- PRECISION HARDENING: Floor to 5-min buckets (300s) ---
+        epoch_ts = (epoch_ts // 150) * 150 # Handle both 150s (deprecated) and 300s safely
+        if (epoch_ts % 300) != 0:
+            epoch_ts = (epoch_ts // 300) * 300
+            
         if self._vatic_cache["epoch"] == epoch_ts and self._vatic_cache["price"] is not None:
             return self._vatic_cache["price"]
 
