@@ -21,15 +21,8 @@ processed_data/
 results/
 
 # Whitelist models
-!data/
-data/*
-!data/models/
-data/models/*
-!data/models/meta_*.pkl
-
-!models/
-models/*
-!models/meta_*.pkl
+!data/models/*.pkl
+!models/*.pkl
 
 # VS Code / OS files
 .vscode/

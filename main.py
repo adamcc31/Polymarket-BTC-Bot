@@ -716,14 +716,24 @@ class TradingBot:
         if wait_seconds > 0:
             await asyncio.sleep(wait_seconds + 5)  # +5s buffer for price settlement
 
-        # Get BTC price at resolution
-        price = await self._binance.get_1m_settlement_price(
-            resolution_time=market.T_resolution,
-            price_type=(market.settlement_price_type or "close"),
-        )
+        # ── RESOLUTION PRICE ACQUISITION (ORACLE FIRST) ─────────
+        # Priority 1: Vatic Oracle (Official Settlement Price for 5m markets)
+        price = await self._discovery.fetch_oracle_price(market.T_resolution)
+        
+        if price is not None:
+            logger.info("resolution_price_oracle_acquired", market_id=market.market_id, price=price)
+        else:
+            # Priority 2: Binance 1m Settlement (Consistent Fallback)
+            logger.warning("resolution_oracle_failed_falling_back_to_binance", market_id=market.market_id)
+            price = await self._binance.get_1m_settlement_price(
+                resolution_time=market.T_resolution,
+                price_type=(market.settlement_price_type or "close"),
+            )
+            
         if price is None:
-            # Final fallback: use last observed price (less correct than candle-aligned resolution).
+            # Priority 3: Last observed price (Final Failsafe)
             price = self._binance.latest_price
+            logger.warning("resolution_final_fallback_used", market_id=market.market_id, price=price)
 
         resolved = await self._dry_run.resolve_trade(trade, price)
         await self._risk_mgr.on_trade_resolved(resolved.pnl_usd or 0)
