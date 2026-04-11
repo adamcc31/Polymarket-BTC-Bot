@@ -326,18 +326,20 @@ class BinanceFeed:
         ws_base = self._ws_base_urls[self._ws_url_index % len(self._ws_base_urls)]
         url = f"{ws_base}?streams={streams_param}"
 
-        if self._verify_ssl:
-            ssl_context = None
-        else:
+        connect_kwargs = {
+            "ping_interval": 20,
+            "ping_timeout": 10,
+            "close_timeout": 5
+        }
+        
+        if not self._verify_ssl:
             import ssl
             ssl_context = ssl.create_default_context()
             ssl_context.check_hostname = False
             ssl_context.verify_mode = ssl.CERT_NONE
+            connect_kwargs["ssl"] = ssl_context
         
-        async with websockets.connect(
-            url, ping_interval=20, ping_timeout=10, close_timeout=5,
-            ssl=ssl_context
-        ) as ws:
+        async with websockets.connect(url, **connect_kwargs) as ws:
             self._ws_connection = ws
             self._retry_count = 0  # Reset on successful connect
             logger.info("binance_ws_connected", streams=self.STREAMS)
