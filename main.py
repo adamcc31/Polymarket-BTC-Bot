@@ -950,23 +950,25 @@ class TradingBot:
 
     async def _run_clob_loop(self) -> None:
         """
-        Poll CLOB data when market is active.
+        Manage CLOB WebSocket lifecycle when market is active.
 
-        Circuit breaker: if CLOBFeed accumulates max_consecutive_404 errors,
-        the market has almost certainly expired. We call force_rediscover() to
-        immediately restart the discovery state machine, then reset the breaker
-        so it is ready for the next market cycle.
+        Starts the WS connection when a market is discovered, restarts it
+        when the market rotates, and monitors the circuit breaker for
+        expired markets.
         """
+        current_market_id: str | None = None
+
         while self._running:
             if self._discovery.is_market_active:
                 market = self._discovery.active_market
-                try:
-                    state = await self._clob.fetch_clob_snapshot(market)
-                    if state:
-                        self._clob._cached_state = state
-                        self._clob._last_fetch_time = __import__("time").time()
-                except Exception as e:
-                    logger.error("clob_loop_error", error=str(e))
+                new_market_id = market.market_id if market else None
+
+                # Start or restart WS when market changes
+                if new_market_id and new_market_id != current_market_id:
+                    await self._clob.stop()
+                    await self._clob.start(market)
+                    current_market_id = new_market_id
+                    logger.info("clob_ws_subscribed_to_market", market_id=new_market_id)
 
                 # ── Circuit breaker check ─────────────────────
                 if self._clob.circuit_breaker_tripped:
@@ -976,9 +978,14 @@ class TradingBot:
                     )
                     self._discovery.force_rediscover()
                     self._clob.reset_circuit_breaker()
+                    current_market_id = None  # Force re-subscribe on next discovery
+            else:
+                # No active market — stop WS if running
+                if current_market_id is not None:
+                    await self._clob.stop()
+                    current_market_id = None
 
-            poll_interval = self._config.get("clob.poll_interval_seconds", 5)
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(2)  # Lightweight check interval
 
     # ── Dashboard ─────────────────────────────────────────────
 
