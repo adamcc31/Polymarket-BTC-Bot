@@ -492,27 +492,26 @@ class MarketDiscovery:
                                 m_patched["startDate"] = iso_open
                                 m_patched["createdAt"] = iso_open
 
-                            # --- VATIC ORACLE HYDRATION (Bypass Gamma API Lag) ---
-                            # The Strike Price is the Oracle Price at the START of this window.
-                            # T_res is the ground truth from Polymarket's endDate metadata.
+                            # --- OFFICIAL GAMMA STRIKE SYNC ---
+                            # We strictly require the official strike price (groupItemThreshold)
+                            # to be published by Polymarket smart contract before discovering.
+                            # If it is missing (None or 0), we skip and retry next pulse.
+                            official_strike_raw = m.get("groupItemThreshold")
+                            if not official_strike_raw or float(official_strike_raw) < 1000.0:
+                                logger.debug("official_strike_pending", slug=slug, market_id=m.get("id"))
+                                continue
+                            
+                            # Success! Lock in the official strike
+                            m_patched = dict(m)
                             if T_res is not None:
-                                # Floor resolution time to 300s to ensure we hit the exact epoch boundary
-                                res_epoch = (int(T_res.timestamp()) // 300) * 300
-                                target_start_ts = res_epoch - window_seconds
-                                
-                                vatic_strike = await self.fetch_oracle_price(target_start_ts)
-                                if vatic_strike:
-                                    # Ensure it's passed as a precise string to bypass Gamma schema parsing
-                                    m_patched["groupItemThreshold"] = str(vatic_strike)
-                                    m_patched["vatic_strike_injected"] = True
-                                    logger.debug(
-                                        "dynamic_5m_vatic_strike_injected", 
-                                        slug=slug, 
-                                        strike=vatic_strike, 
-                                        epoch=target_start_ts,
-                                        market_res_epoch=res_epoch
-                                    )
-    
+                                synthetic_open = T_res - timedelta(minutes=5)
+                                iso_open = synthetic_open.isoformat()
+                                m_patched["startDateIso"] = iso_open
+                                m_patched["startDate"] = iso_open
+                                m_patched["createdAt"] = iso_open
+
+                            logger.info("official_strike_locked", source="gamma_api", strike=official_strike_raw, slug=slug)
+                            
                             parsed = self._parse_market(m_patched)
                             if parsed is None:
                                 logger.info(
@@ -832,6 +831,9 @@ class MarketDiscovery:
                 strike_price = self._extract_strike_price(desc)
                 
             if strike_price is None:
+                if is_dynamic_5m:
+                    return None # No fallbacks for dynamic markets
+                
                 question_l = question.lower()
                 if is_dynamic_5m:
                     # OPTIMIZATION: Check Oracle Cache for Auto-Injection
@@ -1076,48 +1078,27 @@ class MarketDiscovery:
             logger.debug("oracle_cache_bypass_fresh_epoch", epoch=epoch_ts, age_s=round(age_s, 2))
 
         url = "https://api.vatic.trading/api/v1/targets/timestamp"
-        max_retries = 3
-        
-        for attempt in range(max_retries):
-            # STABILITY CHECK: If epoch is in the last 95 seconds, it might be provisional.
-            # Wait for Vatic to settle the "Final" resolution price.
-            now_utc = datetime.now(timezone.utc).timestamp()
-            age_s = now_utc - epoch_ts
-            if age_s < 95: # 95s buffer for high-confidence finality
-                wait_s = max(5.0, 95.0 - age_s)
-                if attempt == 0:
-                    logger.info("oracle_finality_wait_triggered", age_s=round(age_s, 2), wait_s=round(wait_s, 2), epoch=epoch_ts)
-                await asyncio.sleep(min(wait_s, 20.0)) # Gradual wait to keep bot heartbeat alive
-
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
-                        url, 
-                        params={"asset": "btc", "type": "5min", "timestamp": epoch_ts}
-                    )
-                    if resp.is_success:
-                        data = resp.json()
-                        price = data.get("target_price") or data.get("target") or data.get("price")
-                        if price:
-                            price_float = float(price)
-                            # Simpan ke cache
-                            self._vatic_cache = {"epoch": epoch_ts, "price": price_float}
-                            logger.info(
-                                "vatic_oracle_price_acquired", 
-                                epoch=epoch_ts, 
-                                price=price_float,
-                                audit_ts=datetime.now(timezone.utc).isoformat(),
-                                attempts=attempt + 1
-                            )
-                            return price_float
-                    
-                    # If not success or no price, retry after a small delay
-                    logger.debug("vatic_retry_pending", status=resp.status_code, attempt=attempt+1)
-                    await asyncio.sleep(2.0)
-                    
-            except Exception as e:
-                logger.debug("vatic_attempt_failed", error=str(e), attempt=attempt+1)
-                await asyncio.sleep(2.0)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    url, 
+                    params={"asset": "btc", "type": "5min", "timestamp": epoch_ts}
+                )
+                if resp.is_success:
+                    data = resp.json()
+                    price = data.get("target_price") or data.get("target") or data.get("price")
+                    if price:
+                        price_float = float(price)
+                        # Simpan ke cache
+                        self._vatic_cache = {"epoch": epoch_ts, "price": price_float}
+                        logger.info(
+                            "vatic_oracle_price_acquired", 
+                            epoch=epoch_ts, 
+                            price=price_float
+                        )
+                        return price_float
+        except Exception as e:
+            logger.debug("vatic_api_fetch_failed", epoch=epoch_ts, error=str(e))
                 
         return None
 

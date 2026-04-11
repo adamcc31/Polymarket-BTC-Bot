@@ -420,18 +420,15 @@ class TradingBot:
         Full pipeline: features → model → signal → risk → trade.
         """
         # ── ABSOLUTE WARM-UP LOCKDOWN ─────────────────────────
+        # Enforce 10-minute lockdown ONLY in Live Mode. 
+        # Dry-run bypasses this to allow immediate verification of signals.
         now = datetime.now(timezone.utc)
         uptime_s = (now - self._run_started_at).total_seconds()
         warmup_s = 600.0  # 10 Minutes
         
-        if uptime_s < warmup_s:
+        if self._mode == "live" and uptime_s < warmup_s:
             rem = int(warmup_s - uptime_s)
-            logger.info(
-                "trade_skipped",
-                reason="WARMUP_PHASE",
-                remaining_seconds=rem,
-                market_id=getattr(self._discovery.active_market, "market_id", None)
-            )
+            logger.info("warmup_lockdown_active", remaining_seconds=rem)
             return
 
         self._dry_run.increment_bars()
