@@ -193,7 +193,10 @@ class DryRunEngine:
         """
         Resolve a pending trade with actual BTC price at resolution.
 
-        Returns updated PaperTrade with outcome and PnL.
+        Agnostic Resolution Mapping:
+        - BUY_YES wins if BTC price > strike (UP scenario)
+        - BUY_NO wins if BTC price <= strike (DOWN scenario)
+        This is label-agnostic and relies on the mathematical strike condition.
         """
         # Determine outcome
         won = (
@@ -244,6 +247,7 @@ class DryRunEngine:
             "market_id": trade.market_id,
         })
 
+        # Precise logging for PnL tracking (maps UP -> YES win, DOWN -> NO win)
         logger.info(
             "paper_trade_resolved",
             trade_id=resolved.trade_id[:8],
@@ -251,6 +255,8 @@ class DryRunEngine:
             pnl_usd=round(pnl, 4),
             capital=round(capital_after, 2),
             btc_at_resolution=round(btc_at_resolution, 2),
+            strike_price=trade.strike_price,
+            signal=trade.signal_type,
             consecutive_losses=self._consecutive_losses,
         )
 
@@ -276,8 +282,8 @@ class DryRunEngine:
         total_pnl = sum(t.pnl_usd or 0 for t in trades)
 
         # Profit factor
-        gross_profit = sum(t.pnl_usd for t in trades if (t.pnl_usd or 0) > 0)
-        gross_loss = abs(sum(t.pnl_usd for t in trades if (t.pnl_usd or 0) < 0))
+        gross_profit = sum(t.pnl_usd if (t.pnl_usd or 0) > 0 else 0.0 for t in trades)
+        gross_loss = abs(sum(t.pnl_usd if (t.pnl_usd or 0) < 0 else 0.0 for t in trades))
         profit_factor = gross_profit / (gross_loss + 1e-8)
 
         # Max drawdown

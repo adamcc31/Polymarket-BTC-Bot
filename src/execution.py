@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Optional
 
 import structlog
@@ -90,14 +91,6 @@ class ExecutionClient:
     def _initialize_client(self) -> None:
         """
         Initialize py-clob-client SDK.
-
-        AUTHENTICATION ARCHITECTURE (from Polymarket docs):
-          - CLOB trading credentials are DERIVED from wallet private key.
-          - There is NO separate API key/secret for CLOB trading.
-          - py-clob-client.createOrDeriveApiKey() generates CLOB creds
-            deterministically from the wallet's private key signature.
-          - Builder API Keys (POLY_BUILDER_*) are ONLY for the gasless
-            relayer (on-chain ops like approve/redeem), NOT for trading.
         """
         try:
             # Lazy import — only needed for live mode
@@ -121,8 +114,6 @@ class ExecutionClient:
             )
 
             # Step 2: Derive CLOB API credentials from wallet signature
-            # This is deterministic — same private key always produces
-            # the same API credentials. No need to store them separately.
             api_creds = temp_client.derive_api_key()
             logger.info("clob_api_creds_derived")
 
@@ -171,11 +162,12 @@ class ExecutionClient:
 
         signal = approved_bet.signal
 
-        # Determine token
+        # Determine token using agnostic mapping from ActiveMarket (Index 0/1 guaranteed)
         token_key = "YES" if signal.signal == "BUY_YES" else "NO"
         token_id = active_market.clob_token_ids.get(token_key, "")
 
         if not token_id:
+            logger.error("missing_agnostic_token_id", token_key=token_key, market_id=active_market.market_id)
             return OrderRejected(reason="MISSING_TOKEN_ID")
 
         # ── Maker vs taker-like pricing ────────────────────────
@@ -197,11 +189,9 @@ class ExecutionClient:
         use_taker_like = edge >= taker_edge_threshold and spread > 0
 
         if use_taker_like:
-            # Cross more aggressively only when edge is strong.
             order_price = round(clob_ask + taker_price_buffer, 4)
             exec_mode = "TAKER_LIKE"
         else:
-            # Post passively: keep limit price below ask when possible.
             candidate = clob_bid + maker_price_step
             candidate = min(candidate, clob_ask - maker_price_epsilon)
             if candidate <= 0:
@@ -210,6 +200,7 @@ class ExecutionClient:
             exec_mode = "MAKER_POST"
 
         try:
+            # Descriptive logging with label support (UP/DOWN/YES/NO)
             logger.info(
                 "placing_live_order",
                 token_id=token_id[:16],
@@ -221,6 +212,7 @@ class ExecutionClient:
                 clob_bid=clob_bid,
                 clob_ask=clob_ask,
                 edge=round(edge, 6),
+                market_slug=active_market.slug
             )
 
             order = self._clob_client.create_and_post_order(
@@ -244,8 +236,6 @@ class ExecutionClient:
 
     async def _monitor_fill(self, order_id: str) -> FillResult:
         """Monitor order fill status with timeout."""
-        import time
-
         start = time.time()
         last_avg_price: Optional[float] = None
         last_filled_size: Optional[float] = None
@@ -289,9 +279,7 @@ class ExecutionClient:
                         or order_status.get("remainingSize")
                         or 0
                     )
-                    # Keep monitoring until filled or timeout/cancel.
                 elif status in ("CANCELLED", "REJECTED"):
-                    # If we have a partial fill history, report partial instead of total failure.
                     if last_filled_size is not None and last_filled_size > 0:
                         return FillResult(
                             status="PARTIALLY_FILLED",
@@ -351,3 +339,49 @@ class ExecutionClient:
         except Exception as e:
             logger.error("redeem_error", market_id=market_id, error=str(e))
             return False
+
+    # ── Balance & Allowance ───────────────────────────────────
+
+    async def get_usdc_balance(self) -> float:
+        """Fetch liquid USDC balance from the wallet's Polymarket account."""
+        if not self.is_live or not self._clob_client:
+            return 0.0
+
+        try:
+            balance_data = self._clob_client.get_collateral_balance()
+            balance = float(balance_data.get("balance", 0.0))
+            return balance
+        except Exception as e:
+            logger.error("balance_fetch_error", error=str(e))
+            return 0.0
+
+    async def check_and_set_allowance(self) -> bool:
+        """Check and ensure maximum allowance for USDC/CTF exchange."""
+        if not self.is_live or not self._clob_client:
+            return False
+
+        try:
+            allowance_data = self._clob_client.get_allowance()
+            current_allowance = float(allowance_data.get("allowance", 0.0))
+            
+            if current_allowance < 1_000_000:
+                logger.info("updating_usdc_allowance", current=current_allowance)
+                self._clob_client.update_allowance()
+                logger.info("usdc_allowance_updated_to_max")
+            
+            return True
+        except Exception as e:
+            logger.error("allowance_update_error", error=str(e))
+            return False
+
+    async def get_positions(self) -> list[dict]:
+        """Fetch all current positions held by the wallet."""
+        if not self.is_live or not self._clob_client:
+            return []
+
+        try:
+            positions = self._clob_client.get_positions()
+            return positions if isinstance(positions, list) else []
+        except Exception as e:
+            logger.error("positions_fetch_error", error=str(e))
+            return []

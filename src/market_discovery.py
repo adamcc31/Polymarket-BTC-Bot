@@ -485,7 +485,7 @@ class MarketDiscovery:
 
                             # --- VATIC ORACLE HYDRATION ---
                             # window_ts adalah tepat waktu awal epoch (timestamp)
-                            vatic_strike = await self._fetch_vatic_strike(window_ts)
+                            vatic_strike = await self.fetch_oracle_price(window_ts)
                             if vatic_strike:
                                 m_patched["groupItemThreshold"] = str(vatic_strike)
     
@@ -863,22 +863,19 @@ class MarketDiscovery:
         return None
 
     def _extract_yes_probability(self, market_data: dict) -> Optional[float]:
-        """Best-effort parse YES implied probability from Gamma payload."""
-        outcomes_raw = market_data.get("outcomes")
+        """
+        Extract YES/UP implied probability using Agnostic Index Mapping.
+        Primary outcome is always at Index 0.
+        """
         prices_raw = market_data.get("outcomePrices")
         try:
-            outcomes = outcomes_raw if isinstance(outcomes_raw, list) else json.loads(outcomes_raw or "[]")
+            # Note: Gamma often returns outcomePrices as a list or stringified JSON list
             prices = prices_raw if isinstance(prices_raw, list) else json.loads(prices_raw or "[]")
-            if not isinstance(outcomes, list) or not isinstance(prices, list):
+            if not isinstance(prices, list) or not prices:
                 return None
-            idx = None
-            for i, name in enumerate(outcomes):
-                if str(name).strip().upper() == "YES":
-                    idx = i
-                    break
-            if idx is None or idx >= len(prices):
-                return None
-            p = float(prices[idx])
+            
+            # Agnostic Index 0 Mapping for primary outcome (YES / UP)
+            p = float(prices[0])
             return p if 0.0 <= p <= 1.0 else None
         except Exception:
             return None
@@ -975,8 +972,13 @@ class MarketDiscovery:
         except Exception:
             return None
 
-    async def _fetch_vatic_strike(self, epoch_ts: int) -> Optional[float]:
-        """Fetch precise strike price from Vatic Oracle with epoch caching."""
+    async def fetch_oracle_price(self, epoch_ts: int | datetime) -> Optional[float]:
+        """Fetch precise strike or resolution price from Vatic Oracle with epoch caching."""
+        if isinstance(epoch_ts, datetime):
+            if epoch_ts.tzinfo is None:
+                epoch_ts = epoch_ts.replace(tzinfo=timezone.utc)
+            epoch_ts = int(epoch_ts.timestamp())
+
         if self._vatic_cache["epoch"] == epoch_ts and self._vatic_cache["price"] is not None:
             return self._vatic_cache["price"]
 
@@ -989,13 +991,13 @@ class MarketDiscovery:
                 )
                 if resp.is_success:
                     data = resp.json()
-                    # Per the documentation, they provide strike price absolute based on epoch timestamp.
+                    # Per the documentation, they provide price absolute based on epoch timestamp.
                     price = data.get("target_price") or data.get("target") or data.get("price")
                     if price:
                         price_float = float(price)
                         # Simpan ke cache
                         self._vatic_cache = {"epoch": epoch_ts, "price": price_float}
-                        logger.info("vatic_oracle_strike_acquired", epoch=epoch_ts, strike=price_float)
+                        logger.info("vatic_oracle_price_acquired", epoch=epoch_ts, price=price_float)
                         return price_float
         except Exception as e:
             logger.debug("vatic_api_fetch_failed", epoch=epoch_ts, error=str(e))
@@ -1045,26 +1047,40 @@ class MarketDiscovery:
 
     @staticmethod
     def _extract_token_ids(tokens: list, market_data: dict) -> dict:
-        """Extract YES/NO CLOB token IDs from market data."""
+        """
+        Agnostic Index Mapping (Agnostic to Outcome Labels):
+        Binary markets on Polymarket consistently use Index 0 for the primary 
+        outcome (Yes/Up) and Index 1 for the inverse (No/Down).
+        """
         token_ids = {"YES": "", "NO": ""}
 
-        if isinstance(tokens, list):
-            for token in tokens:
-                outcome = str(token.get("outcome", "")).upper()
-                token_id = (
+        if isinstance(tokens, list) and len(tokens) >= 2:
+            # Map index 0 to YES/UP, index 1 to NO/DOWN
+            for i, key in enumerate(["YES", "NO"]):
+                token = tokens[i]
+                # Extract outcome label for logging only (agnostic execution)
+                label = str(token.get("outcome", "unknown")).upper()
+                
+                t_id = (
                     token.get("token_id")
                     or token.get("tokenId")
                     or token.get("clobTokenId")
                     or ""
                 )
-                if outcome in ("YES", "NO") and token_id:
-                    token_ids[outcome] = token_id
+                if t_id:
+                    token_ids[key] = t_id
+                    logger.debug(
+                        "token_mapped_by_index",
+                        index=i,
+                        internal_key=key,
+                        market_label=label,
+                        token_id=t_id[:16]
+                    )
 
-        # Fallback: try clobTokenIds field
+        # Fallback for older API versions or edge cases
         if not token_ids.get("YES"):
             clob_ids = market_data.get("clobTokenIds", [])
             if isinstance(clob_ids, str):
-                # Some responses return stringified JSON list.
                 try:
                     import json
                     clob_ids = json.loads(clob_ids)
