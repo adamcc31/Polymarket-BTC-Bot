@@ -480,7 +480,7 @@ class TradingBot:
         ).lower()
         p_model = q_fair
         if prob_source in ("ensemble", "hybrid"):
-            model_prob = self._model.predict(np.array(fv.values))
+            model_prob = self._model.predict(np.array(fv.values), metadata=fv.metadata)
             if prob_source == "ensemble":
                 p_model = model_prob
             else:

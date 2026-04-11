@@ -50,15 +50,25 @@ class ModelEnsemble:
 
     def __init__(self, config: ConfigManager) -> None:
         self._config = config
+        
+        # --- Base Model (24 features) ---
         self._lgbm_model = None
         self._logreg_model = None
-        self._scaler = None  # StandardScaler for LogReg
-        self._calibrator = None  # CalibratedClassifierCV wrapper or standalone
+        self._scaler = None
+        self._calibrator = None
+        
+        # --- Meta-Brain (5 features) ---
+        self._meta_lgbm = None
+        self._meta_logreg = None
+        self._meta_scaler = None
+        self._meta_calibrator_isotonic = None
+
         self._lgbm_weight = config.get("model.ensemble_lgbm_weight", 0.70)
         self._logreg_weight = config.get("model.ensemble_logreg_weight", 0.30)
         self._calibration_method = config.get("model.calibration_method", "isotonic")
         self._version: Optional[str] = None
         self._is_loaded = False
+        self._has_meta_brain = False
 
     # ── Public Interface ──────────────────────────────────────
 
@@ -70,17 +80,19 @@ class ModelEnsemble:
     def version(self) -> str:
         return self._version or "none"
 
-    def predict(self, feature_vector: np.ndarray) -> float:
+    def predict(self, feature_vector: np.ndarray, metadata: Any = None) -> float:
         """
-        Predict P(YES outcome) from feature vector.
+        Predict P(YES outcome) using STACKED ENSEMBLE architecture.
+
+        Stage 1: Base Model (24 features) -> raw_p
+        Stage 2: Meta-Brain (5 features) -> final_p
 
         Args:
             feature_vector: numpy array of shape (1, 24)
+            metadata: FeatureMetadata object for context (Stage 2 features)
 
         Returns:
             P_model: calibrated probability ∈ [0, 1]
-
-        If model not loaded, returns 0.5 (neutral — will ABSTAIN due to no edge).
         """
         if not self._is_loaded:
             logger.warning("model_not_loaded_returning_neutral")
@@ -89,39 +101,77 @@ class ModelEnsemble:
         try:
             X = np.array(feature_vector).reshape(1, -1)
 
-            # LightGBM prediction (calibrated if calibrator available)
+            # --- STAGE 1: Base Model Inference ---
+            # LightGBM prediction
             if self._calibrator is not None:
                 lgbm_prob = self._calibrator.predict_proba(X)[0, 1]
             else:
                 lgbm_prob = self._lgbm_model.predict_proba(X)[0, 1]
 
-            # LogReg prediction (inherently better calibrated)
+            # LogReg prediction
             if self._logreg_model is not None and self._scaler is not None:
                 X_scaled = self._scaler.transform(X)
                 logreg_prob = self._logreg_model.predict_proba(X_scaled)[0, 1]
             else:
-                logreg_prob = lgbm_prob  # Fallback to LGBM only
+                logreg_prob = lgbm_prob  # Fallback
 
-            # Weighted ensemble
-            P_model = (
-                self._lgbm_weight * lgbm_prob
-                + self._logreg_weight * logreg_prob
-            )
+            # Weighted base probability (raw_p)
+            raw_p = (self._lgbm_weight * lgbm_prob + self._logreg_weight * logreg_prob)
+            raw_p = max(0.0, min(1.0, raw_p))
 
-            # Clamp to [0, 1]
-            P_model = max(0.0, min(1.0, P_model))
+            # If Meta-Brain is not available or metadata missing, return Base Model output (backwards compatibility)
+            if not self._has_meta_brain or metadata is None:
+                return float(raw_p)
 
-            logger.debug(
-                "model_prediction",
-                P_model=round(P_model, 4),
-                lgbm_prob=round(lgbm_prob, 4),
-                logreg_prob=round(logreg_prob, 4),
-            )
+            # --- STAGE 2: Meta-Brain Inference ---
+            try:
+                # 1. distance_to_strike_bps: 1% = 100 BPS
+                dist_bps = (metadata.current_btc_price - metadata.strike_price) / metadata.strike_price * 10000.0
+                
+                # 2. is_coinflip: raw_p in [0.4, 0.6]
+                is_coinflip = 1.0 if 0.40 <= raw_p <= 0.60 else 0.0
+                
+                # 3. live_edge = raw_p - current_ask
+                # We use clob_ask from metadata which main.py should populate via feature_engine
+                clob_ask = getattr(metadata, "clob_ask", 0.5)
+                live_edge = raw_p - clob_ask
 
-            return float(P_model)
+                # Construct Meta-Feature Vector (matches retrain_meta_calibrator.py FEATURES)
+                meta_X = np.array([
+                    dist_bps,
+                    metadata.TTR_minutes,
+                    raw_p,
+                    live_edge,
+                    is_coinflip
+                ]).reshape(1, -1)
+
+                # Meta-Ensemble Predictions
+                meta_lgbm_prob = self._meta_lgbm.predict(meta_X)[0]
+                
+                meta_X_scaled = self._meta_scaler.transform(meta_X)
+                meta_logreg_prob = self._meta_logreg.predict_proba(meta_X_scaled)[0, 1]
+                
+                meta_p = (0.7 * meta_lgbm_prob + 0.3 * meta_logreg_prob)
+                
+                # Meta-Isotonic Calibration
+                final_p = self._meta_calibrator_isotonic.transform([meta_p])[0]
+                final_p = max(0.0, min(1.0, final_p))
+
+                logger.debug(
+                    "stacked_inference_complete",
+                    raw_p=round(raw_p, 4),
+                    final_p=round(final_p, 4),
+                    dist_bps=round(dist_bps, 1)
+                )
+
+                return float(final_p)
+
+            except Exception as meta_e:
+                logger.error("meta_inference_failed_using_base", error=str(meta_e))
+                return float(raw_p)
 
         except Exception as e:
-            logger.error("model_predict_error", error=str(e))
+            logger.error("stacked_predict_error", error=str(e), exc_info=True)
             return 0.5
 
     # ── Model Loading ─────────────────────────────────────────
@@ -153,9 +203,15 @@ class ModelEnsemble:
         logreg_path = model_dir / f"model_logreg_{version}.pkl"
         scaler_path = model_dir / f"scaler_{version}.pkl"
         calibrator_path = model_dir / f"calibrator_{version}.pkl"
+        
+        # Meta-Brain paths (using specific names from training script)
+        meta_lgbm_path = model_dir / "meta_lgbm.pkl"
+        meta_logreg_path = model_dir / "meta_logreg.pkl"
+        meta_scaler_path = model_dir / "meta_scaler.pkl"
+        meta_calibrator_path = model_dir / "meta_calibrator_isotonic.pkl"
 
         try:
-            # Load LightGBM (required)
+            # 1. Load Base Model (required)
             if not lgbm_path.exists():
                 logger.error("lgbm_model_not_found", path=str(lgbm_path))
                 return False
@@ -163,26 +219,33 @@ class ModelEnsemble:
             with open(lgbm_path, "rb") as f:
                 self._lgbm_model = pickle.load(f)
 
-            # Load LogReg (optional)
             if logreg_path.exists():
                 with open(logreg_path, "rb") as f:
                     self._logreg_model = pickle.load(f)
 
-            # Load Scaler (for LogReg)
             if scaler_path.exists():
                 with open(scaler_path, "rb") as f:
                     self._scaler = pickle.load(f)
 
-            # Load Calibrator (for LightGBM — CRITICAL)
             if calibrator_path.exists():
                 with open(calibrator_path, "rb") as f:
                     self._calibrator = pickle.load(f)
-                logger.info("calibrator_loaded", method=self._calibration_method)
+
+            # 2. Load Meta-Brain (optional)
+            if all(p.exists() for p in [meta_lgbm_path, meta_logreg_path, meta_scaler_path, meta_calibrator_path]):
+                with open(meta_lgbm_path, "rb") as f:
+                    self._meta_lgbm = pickle.load(f)
+                with open(meta_logreg_path, "rb") as f:
+                    self._meta_logreg = pickle.load(f)
+                with open(meta_scaler_path, "rb") as f:
+                    self._meta_scaler = pickle.load(f)
+                with open(meta_calibrator_path, "rb") as f:
+                    self._meta_calibrator_isotonic = pickle.load(f)
+                
+                self._has_meta_brain = True
+                logger.info("meta_brain_loaded_stacking_enabled")
             else:
-                logger.warning(
-                    "calibrator_not_found_lgbm_uncalibrated",
-                    path=str(calibrator_path),
-                )
+                logger.warning("meta_brain_not_found_stacking_disabled")
 
             self._version = version
             self._is_loaded = True

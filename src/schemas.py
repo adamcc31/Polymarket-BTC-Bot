@@ -127,6 +127,7 @@ class FeatureMetadata(BaseModel):
     current_btc_price: float
     TTR_minutes: float
     TTR_phase: Literal["EARLY", "ENTRY_WINDOW", "LATE"]
+    clob_ask: float = Field(default=0.5, description="Best ask for the relevant side")
     compute_lag_ms: float = Field(default=0.0, description="Feature computation latency")
 
 
