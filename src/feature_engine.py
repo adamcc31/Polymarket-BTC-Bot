@@ -43,7 +43,7 @@ def load_feature_list() -> List[str]:
 
 
 FEATURE_NAMES = load_feature_list()
-assert len(FEATURE_NAMES) == 24, f"Expected 24 features, got {len(FEATURE_NAMES)}"
+assert len(FEATURE_NAMES) == 22, f"Expected 22 features, got {len(FEATURE_NAMES)}"
 
 
 def z_score_safe(series: pd.Series, window: int = 100) -> pd.Series:
@@ -59,7 +59,7 @@ def z_score_safe(series: pd.Series, window: int = 100) -> pd.Series:
 
 class FeatureEngine:
     """
-    Computes 24-feature vector for model inference.
+    Computes 22-feature vector for model inference.
 
     Anti-lookahead guarantee: all rolling windows use shift(1).
     """
@@ -74,7 +74,7 @@ class FeatureEngine:
         clob_state: CLOBState,
     ) -> Optional[FeatureVector]:
         """
-        Compute full 24-feature vector from current state.
+        Compute full 22-feature vector from current state.
 
         Args:
             binance_feed: Live Binance data feed
@@ -82,7 +82,7 @@ class FeatureEngine:
             clob_state: Current CLOB state
 
         Returns:
-            FeatureVector with 24 features + metadata, or None if insufficient data.
+            FeatureVector with 22 features + metadata, or None if insufficient data.
         """
         start_time = time.time()
 
@@ -102,12 +102,11 @@ class FeatureEngine:
         try:
             features = {}
 
-            # ── 01: OBI ───────────────────────────────────────
-            obi = binance_feed.get_ob_imbalance(levels=5)
-            features["OBI"] = obi if obi is not None else 0.0
+            # ── 01: OBI (AMPUTATED - Replaced by 0) ────────────
+            features["OBI"] = 0.0
 
-            # ── 02: TFM_normalized ────────────────────────────
-            features["TFM_normalized"] = self._compute_tfm(binance_feed)
+            # ── 02: TFM_normalized (AMPUTATED - Replaced by 0) ──
+            features["TFM_normalized"] = 0.0
 
             # ── 03: VAM ───────────────────────────────────────
             features["VAM"] = self._compute_vam(ohlcv)

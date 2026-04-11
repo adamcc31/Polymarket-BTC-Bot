@@ -394,9 +394,24 @@ class TradingBot:
 
     async def _on_bar_close(self, bar: dict) -> None:
         """
-        Called on each 15-minute bar close.
+        Called on each 15-minute bar close or 10s ultrashort pulse.
         Full pipeline: features → model → signal → risk → trade.
         """
+        # ── ABSOLUTE WARM-UP LOCKDOWN ─────────────────────────
+        now = datetime.now(timezone.utc)
+        uptime_s = (now - self._run_started_at).total_seconds()
+        warmup_s = 600.0  # 10 Minutes
+        
+        if uptime_s < warmup_s:
+            rem = int(warmup_s - uptime_s)
+            logger.info(
+                "trade_skipped",
+                reason="WARMUP_PHASE",
+                remaining_seconds=rem,
+                market_id=getattr(self._discovery.active_market, "market_id", None)
+            )
+            return
+
         self._dry_run.increment_bars()
 
         # Check if we have an active market
