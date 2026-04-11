@@ -403,10 +403,7 @@ class MarketDiscovery:
           not the current 5-min window open time.  We synthesize a correct T_open
           as T_resolution − 5 min so that the lifespan check in _parse_market passes.
         """
-        event_slugs: list[str] = self._config.get(
-            "market_discovery.dynamic_5m_event_slugs",
-            ["btc-updown-5m"],
-        )
+        event_slugs: list[str] = self._config.get("market_discovery.dynamic_5m_event_slugs") or ["btc-updown-5m"]
         candidates: list[dict] = []
 
         async with httpx.AsyncClient(timeout=15.0, verify=self._verify_ssl) as client:
