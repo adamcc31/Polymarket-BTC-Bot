@@ -79,6 +79,7 @@ from src.model import ModelEnsemble
 from src.fair_probability import FairProbabilityEngine
 from src.risk_manager import RiskManager
 from src.signal_generator import SignalGenerator
+from src.redeemer import RedeemerWorker
 from src.telegram_notifier import TelegramNotifier
 
 
@@ -121,6 +122,7 @@ class TradingBot:
         self._fair_prob_engine = FairProbabilityEngine(self._config)
         self._exporter: Exporter | None = None
         self._telegram = TelegramNotifier(self._config)
+        self._redeemer = RedeemerWorker(self._config, self._execution)
 
         # Dry run / live engine
         initial_capital = 50.0 if self._requested_mode == "dry-run" else 50.0
@@ -331,6 +333,9 @@ class TradingBot:
             asyncio.create_task(
                 self._ultrashort_market_loop(), name="ultrashort_loop"
             ),
+            asyncio.create_task(
+                self._redeemer.start(), name="redeemer_worker"
+            ),
         ]
 
         # Dry-run must finish within max duration (default 48h).
@@ -354,6 +359,7 @@ class TradingBot:
         await self._binance.stop()
         await self._discovery.stop()
         await self._clob.stop()
+        await self._redeemer.stop()
 
         # Export session data
         metrics = self._dry_run.compute_session_metrics(self._model.version)
@@ -985,20 +991,20 @@ def main(
         cfg = ConfigManager.get_instance()
         model = ModelEnsemble(cfg)
         if model.rollback():
-            click.echo("✓ Model rolled back successfully")
+            click.echo("Model rolled back successfully")
         else:
-            click.echo("✗ Rollback failed — no previous version available")
+            click.echo("Rollback failed - no previous version available")
         cfg.stop()
         return
 
     # Trading mode
-    click.echo(f"\n🚀 Starting Polymarket Bot — Mode: {mode.upper()}\n")
+    click.echo(f"\nStarting Polymarket Bot - Mode: {mode.upper()}\n")
 
     bot = TradingBot(mode=mode, confirm_live=confirm_live)
 
     # Graceful shutdown handler
     def handle_shutdown(sig, frame):
-        click.echo("\n\n⏹  Shutting down gracefully...")
+        click.echo("\n\nShutting down gracefully...")
         asyncio.get_event_loop().call_soon_threadsafe(
             lambda: asyncio.create_task(bot.stop())
         )

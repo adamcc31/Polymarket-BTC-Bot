@@ -31,6 +31,7 @@ class TelegramNotifier:
             self._enabled = True
 
         self._rest_timeout_s = float(self._config.get("telegram.timeout_seconds", 10.0))
+        self._verify_ssl = os.getenv("SSL_VERIFY", "true").lower() == "true"
 
     async def send_message(
         self,
@@ -45,7 +46,7 @@ class TelegramNotifier:
         if not self._token or not self._chat_id:
             return
 
-        text = f"🔥 <b>{title}</b>\n{message}"
+        text = f"<b>{title}</b>\n{message}"
         url = f"https://api.telegram.org/bot{self._token}/sendMessage"
         payload = {
             "chat_id": str(self._chat_id),
@@ -56,7 +57,7 @@ class TelegramNotifier:
         if parse_mode:
             payload["parse_mode"] = parse_mode
 
-        async with httpx.AsyncClient(timeout=self._rest_timeout_s) as client:
+        async with httpx.AsyncClient(timeout=self._rest_timeout_s, verify=self._verify_ssl) as client:
             try:
                 resp = await client.post(url, json=payload)
                 resp.raise_for_status()
@@ -89,7 +90,7 @@ class TelegramNotifier:
             "document": (os.path.basename(file_path), open(file_path, "rb"))
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=30.0, verify=self._verify_ssl) as client:
             try:
                 resp = await client.post(url, data=data, files=files)
                 resp.raise_for_status()

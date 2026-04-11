@@ -8,6 +8,7 @@ Constructs CLOBState with liquidity metrics and vig calculation.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -40,6 +41,7 @@ class CLOBFeed:
         # Retry config
         self._max_retries = 3
         self._backoff_delays = [1, 2, 4]
+        self._verify_ssl = os.getenv("SSL_VERIFY", "true").lower() == "true"
 
         # Circuit breaker
         self._max_consecutive_404 = config.get("clob.max_consecutive_404", 3)
@@ -185,7 +187,7 @@ class CLOBFeed:
         """
         for attempt in range(self._max_retries):
             try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
+                async with httpx.AsyncClient(timeout=10.0, verify=self._verify_ssl) as client:
                     resp = await client.get(
                         f"{self.CLOB_BASE_URL}/book",
                         params={"token_id": token_id},

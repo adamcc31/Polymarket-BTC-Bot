@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -110,6 +111,7 @@ class BinanceFeed:
         self._ws_connection: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
         self._retry_count = 0
+        self._verify_ssl = os.getenv("SSL_VERIFY", "true").lower() == "true"
 
     # ── Public Properties ─────────────────────────────────────
 
@@ -324,8 +326,17 @@ class BinanceFeed:
         ws_base = self._ws_base_urls[self._ws_url_index % len(self._ws_base_urls)]
         url = f"{ws_base}?streams={streams_param}"
 
+        if self._verify_ssl:
+            ssl_context = None
+        else:
+            import ssl
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+        
         async with websockets.connect(
-            url, ping_interval=20, ping_timeout=10, close_timeout=5
+            url, ping_interval=20, ping_timeout=10, close_timeout=5,
+            ssl=ssl_context
         ) as ws:
             self._ws_connection = ws
             self._retry_count = 0  # Reset on successful connect
@@ -576,7 +587,7 @@ class BinanceFeed:
             base = self._rest_base_urls[idx]
             url = f"{base}{path}"
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                async with httpx.AsyncClient(timeout=30.0, verify=self._verify_ssl) as client:
                     resp = await client.get(url, params=params)
                     resp.raise_for_status()
                 self._rest_url_index = idx

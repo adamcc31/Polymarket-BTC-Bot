@@ -4,7 +4,7 @@ model.py — LightGBM + Logistic Regression ensemble with calibration.
 Architecture:
   Primary   : LightGBM Classifier
   Secondary : Logistic Regression (baseline, overfit detection)
-  Ensemble  : P_model = 0.7 × LGBM_calibrated + 0.3 × LogReg_prob
+  Ensemble  : P_model = 0.7 * LGBM_calibrated + 0.3 * LogReg_prob
 
 CRITICAL (from validation):
   LightGBM outputs are NOT well-calibrated probabilities by default.
@@ -43,7 +43,7 @@ class ModelEnsemble:
     """
     LightGBM + LogReg ensemble with Isotonic Regression calibration.
 
-    The ensemble outputs calibrated P(YES outcome) ∈ [0, 1].
+    The ensemble outputs calibrated P(YES outcome) in [0, 1].
     Calibration is performed post-training using isotonic regression
     because tree-based models produce biased probability estimates.
     """

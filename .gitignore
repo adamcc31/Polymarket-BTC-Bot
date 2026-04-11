@@ -12,21 +12,29 @@ venv/
 *.pkl
 
 # Strategy Logs & Telemetry
-logs/*.log
-logs/*.csv
+logs/
 tmp_tokens.txt
 
 # Large Dataset Folders
-data/
 raw_data/
 processed_data/
 results/
-models/
+
+# Whitelist models
+!data/
+data/*
+!data/models/
+data/models/*
+!data/models/meta_*.pkl
+
+!models/
+models/*
+!models/meta_*.pkl
 
 # VS Code / OS files
 .vscode/
 .DS_Store
 Thumbs.db
 
-#example project
+# example project
 example_project

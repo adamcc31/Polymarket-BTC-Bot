@@ -15,21 +15,23 @@ from sklearn.model_selection import train_test_split
 ROOT_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-MODELS_DIR = ROOT_DIR / "models"
+from src.model import _get_model_dir
+
+MODELS_DIR = _get_model_dir()
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 INPUT_CSV = ROOT_DIR / "sot_dataset_ready.csv"
 
 def train_meta_calibrator():
-    print("🧠 Starting Meta-Calibrator Training Pipeline...")
+    print("Starting Meta-Calibrator Training Pipeline...")
     
     if not INPUT_CSV.exists():
-        print(f"❌ Error: {INPUT_CSV} not found. Run generate_sot_dataset.py first.")
+        print(f"Error: {INPUT_CSV} not found. Run generate_sot_dataset.py first.")
         return
 
     # Load SOT Dataset
     df = pd.read_csv(INPUT_CSV)
-    print(f"📊 Loaded {len(df)} market-level samples.")
+    print(f"Loaded {len(df)} market-level samples.")
 
     # FEATURES: distance_to_strike_bps, avg_TTR_minutes, avg_P_model, avg_live_edge, is_coinflip
     FEATURES = ["distance_to_strike_bps", "avg_TTR_minutes", "avg_P_model", "avg_live_edge", "is_coinflip"]
@@ -100,14 +102,14 @@ def train_meta_calibrator():
     lloss = log_loss(y_val, final_probs)
     
     print("\n" + "="*40)
-    print("📊 META-CALIBRATOR TRAINING SUMMARY")
+    print("META-CALIBRATOR TRAINING SUMMARY")
     print("="*40)
     print(f"Brier Score:   {brier:.6f}")
     print(f"Log Loss:      {lloss:.6f}")
     
     # Calibration Curve Summary
     prob_true, prob_pred = calibration_curve(y_val, final_probs, n_bins=5)
-    print("\n📈 Calibration Curve (Empirical vs Predicted):")
+    print("\nCalibration Curve (Empirical vs Predicted):")
     for t, p in zip(prob_true, prob_pred):
         print(f"  Bin Approx: Predicted={p:.2f} -> Realized={t:.2f}")
 
@@ -127,7 +129,7 @@ def train_meta_calibrator():
         with open(path, "wb") as f:
             pickle.dump(obj, f)
     
-    print(f"\n✅ Meta-Calibrator artifacts saved to {MODELS_DIR}")
+    print(f"\nMeta-Calibrator artifacts saved to {MODELS_DIR}")
     print("Directives achieved: Optimized for Log Loss & Brier Score with Isotonic Scaling.")
 
 if __name__ == "__main__":

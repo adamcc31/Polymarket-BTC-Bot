@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -89,6 +90,7 @@ class MarketDiscovery:
         self._target_ttr_minutes = config.get("market_discovery.target_ttr_minutes", 5.0)
         self._running = False
         self._last_log_time: float = 0.0
+        self._verify_ssl = os.getenv("SSL_VERIFY", "true").lower() == "true"
         self._candidate_pool: list[dict[str, Any]] = []
         self._vatic_cache: dict[str, Any] = {"epoch": None, "price": None}
 
@@ -407,7 +409,7 @@ class MarketDiscovery:
         )
         candidates: list[dict] = []
 
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, verify=self._verify_ssl) as client:
             now_ts = int(datetime.now(timezone.utc).timestamp())
             for base_slug in event_slugs:
                 window_seconds = 300
@@ -567,7 +569,7 @@ class MarketDiscovery:
             dynamic_candidates = await self._query_dynamic_5m_markets(spot_price)
 
             # ── Path B: generic volume-sorted scan for daily/hourly markets ──
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, verify=self._verify_ssl) as client:
                 resp = await client.get(
                     f"{self.GAMMA_API_BASE}/markets",
                     params={
