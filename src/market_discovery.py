@@ -178,7 +178,7 @@ class MarketDiscovery:
             )
         else:
             # Cegah transisi ke WAITING jika kita menjalankan strategi 5m dynamic
-            has_dynamic_targets = bool(self._config.get("market_discovery.dynamic_5m_event_slugs", []))
+            has_dynamic_targets = bool(self._config.get("market_discovery.dynamic_5m_event_slugs", ["btc-updown-5m"]))
             if has_dynamic_targets:
                 # Tetap di SEARCHING mode, stalking oracle price
                 logger.debug("dynamic_market_stalking", msg="Staying in SEARCHING state to monitor Oracle")
@@ -493,10 +493,20 @@ class MarketDiscovery:
                                 m_patched["createdAt"] = iso_open
 
                             # --- OFFICIAL GAMMA STRIKE SYNC ---
-                            # We strictly require the official strike price (groupItemThreshold)
-                            # to be published by Polymarket smart contract before discovering.
-                            # If it is missing (None or 0), we skip and retry next pulse.
-                            official_strike_raw = m.get("groupItemThreshold")
+                            # Broaden the extraction keys
+                            official_strike_raw = (
+                                m.get("groupItemThreshold") or 
+                                m.get("initial_price") or 
+                                m.get("strike_price")
+                            )
+                            
+                            # Fallback to regex on the question text if keys are missing
+                            if not official_strike_raw or float(official_strike_raw) < 1000.0:
+                                q_text = m.get("question", "")
+                                match = re.search(r"\$([0-9]{1,3}(?:,?[0-9]{3})*(?:\.[0-9]+)?)", q_text)
+                                if match:
+                                    official_strike_raw = match.group(1).replace(",", "")
+                                    
                             if not official_strike_raw or float(official_strike_raw) < 1000.0:
                                 logger.debug("official_strike_pending", slug=slug, market_id=m.get("id"))
                                 continue

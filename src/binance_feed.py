@@ -183,7 +183,7 @@ class BinanceFeed:
             )
             return len(self._ohlcv_buffer)
 
-        except httpx.HTTPError as e:
+        except Exception as e:
             logger.error("binance_bootstrap_failed", error=str(e))
             return 0
 
