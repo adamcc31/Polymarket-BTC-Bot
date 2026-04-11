@@ -224,6 +224,7 @@ class FeatureEngine:
                 current_btc_price=current_price,
                 TTR_minutes=ttr_minutes,
                 TTR_phase=ttr_phase,
+                clob_ask=clob_state.yes_ask,
                 compute_lag_ms=compute_lag_ms,
             )
 
