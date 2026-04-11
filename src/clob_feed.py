@@ -157,25 +157,43 @@ class CLOBFeed:
                                 break
                                 
                             data = json.loads(message)
-                            evt_type = data.get("event_type")
                             
-                            if data.get("type") == "pong":
-                                continue
+                            # Polymarket WS may send arrays (initial snapshot)
+                            # or dicts (individual updates). Normalize to list.
+                            items = data if isinstance(data, list) else [data]
+                            
+                            for item in items:
+                                if not isinstance(item, dict):
+                                    continue
+                                    
+                                evt_type = item.get("event_type")
                                 
-                            if evt_type == "best_bid_ask":
-                                asset_id = str(data.get("asset_id"))
-                                best_bid = float(data.get("best_bid", 0) or 0)
-                                best_ask = float(data.get("best_ask", 0) or 0)
-                                self._cache_dict[asset_id] = {"best_bid": best_bid, "best_ask": best_ask}
-                                self._rebuild_clob_state()
+                                if item.get("type") == "pong":
+                                    continue
+                                    
+                                if evt_type == "best_bid_ask":
+                                    asset_id = str(item.get("asset_id"))
+                                    best_bid = float(item.get("best_bid", 0) or 0)
+                                    best_ask = float(item.get("best_ask", 0) or 0)
+                                    self._cache_dict[asset_id] = {"best_bid": best_bid, "best_ask": best_ask}
+                                    self._rebuild_clob_state()
+                                    
+                                elif evt_type == "price_change" and isinstance(item.get("price_changes"), list):
+                                    for pc in item["price_changes"]:
+                                        aid = str(pc.get("asset_id"))
+                                        best_bid = float(pc.get("best_bid", 0) or 0)
+                                        best_ask = float(pc.get("best_ask", 0) or 0)
+                                        self._cache_dict[aid] = {"best_bid": best_bid, "best_ask": best_ask}
+                                    self._rebuild_clob_state()
                                 
-                            elif evt_type == "price_change" and isinstance(data.get("price_changes"), list):
-                                for pc in data["price_changes"]:
-                                    aid = str(pc.get("asset_id"))
-                                    best_bid = float(pc.get("best_bid", 0) or 0)
-                                    best_ask = float(pc.get("best_ask", 0) or 0)
-                                    self._cache_dict[aid] = {"best_bid": best_bid, "best_ask": best_ask}
-                                self._rebuild_clob_state()
+                                elif "market" in str(item.get("type", "")).lower():
+                                    # Initial market data — may contain price info
+                                    asset_id = str(item.get("asset_id", ""))
+                                    if asset_id and (item.get("best_bid") is not None or item.get("best_ask") is not None):
+                                        best_bid = float(item.get("best_bid", 0) or 0)
+                                        best_ask = float(item.get("best_ask", 0) or 0)
+                                        self._cache_dict[asset_id] = {"best_bid": best_bid, "best_ask": best_ask}
+                                        self._rebuild_clob_state()
 
                     except websockets.exceptions.ConnectionClosed:
                         logger.warning("ws_connection_closed")
