@@ -128,12 +128,15 @@ class CLOBFeed:
 
                 logger.info("ws_connecting", tokens=token_ids)
                 
-                ssl_context = None
+                # For wss://, ssl must be True (default) or a custom SSLContext.
+                # ssl=None means "no SSL" which is incompatible with wss://.
                 if not self._verify_ssl:
                     import ssl
                     ssl_context = ssl.create_default_context()
                     ssl_context.check_hostname = False
                     ssl_context.verify_mode = ssl.CERT_NONE
+                else:
+                    ssl_context = True  # Use default SSL verification
 
                 async with websockets.connect(self.WS_URL, ssl=ssl_context) as ws:
                     logger.info("ws_connected")
