@@ -225,6 +225,20 @@ class ModelEnsemble:
         meta_scaler_path = model_dir / "meta_scaler.pkl"
         meta_calibrator_path = model_dir / "meta_calibrator_isotonic.pkl"
 
+        # --- Diagnostic Debug Logging ---
+        all_paths = {
+            "stage1_lgbm": lgbm_path,
+            "stage1_logreg": logreg_path,
+            "stage1_scaler": scaler_path,
+            "stage1_calibrator": calibrator_path,
+            "stage2_meta_lgbm": meta_lgbm_path,
+            "stage2_meta_logreg": meta_logreg_path,
+            "stage2_meta_scaler": meta_scaler_path,
+            "stage2_meta_calibrator": meta_calibrator_path,
+        }
+        for name, path in all_paths.items():
+            logger.debug("attempting_to_load_artifact", name=name, path=str(path), exists=path.exists())
+
         try:
             # 1. Load Base Model (required)
             if not lgbm_path.exists():
@@ -268,8 +282,12 @@ class ModelEnsemble:
             logger.info(
                 "model_loaded",
                 version=version,
-                has_logreg=self._logreg_model is not None,
-                has_calibrator=self._calibrator is not None,
+                has_logreg_s1=self._logreg_model is not None,
+                has_calibrator_s1=self._calibrator is not None,
+                has_meta_brain_s2=self._has_meta_brain,
+                has_meta_lgbm_s2=self._meta_lgbm is not None,
+                has_meta_logreg_s2=self._meta_logreg is not None,
+                has_meta_calibrator_s2=self._meta_calibrator_isotonic is not None,
             )
             return True
 
