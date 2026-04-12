@@ -65,6 +65,11 @@ class ModelEnsemble:
         self._meta_scaler = None
         self._meta_calibrator_isotonic = None
 
+        # --- Meta-Brain V2 (Microstructure) ---
+        self._meta_v2_lgbm = None
+        self._meta_v2_calibrator = None
+        self._has_meta_v2 = False
+
         self._lgbm_weight = config.get("model.ensemble_lgbm_weight", 0.70)
         self._logreg_weight = config.get("model.ensemble_logreg_weight", 0.30)
         self._calibration_method = config.get("model.calibration_method", "isotonic")
@@ -105,6 +110,34 @@ class ModelEnsemble:
 
             from src.feature_engine import FEATURE_NAMES
             X_df = pd.DataFrame(X, columns=FEATURE_NAMES)
+
+            # --- STAGE 0: META-BRAIN V2 OVERRIDE ---
+            if self._has_meta_v2 and metadata is not None:
+                try:
+                    ttr_min = metadata.TTR_minutes
+                    gap_abs = metadata.current_btc_price - metadata.strike_price
+                    gap_pct = (gap_abs / metadata.strike_price) * 100.0
+                    
+                    mid_yes = float(X_df["clob_yes_mid"].iloc[0])
+                    spread_yes = float(X_df["clob_yes_spread"].iloc[0])
+                    
+                    meta_v2_features = ["TTR_minutes", "gap_absolute", "gap_percentage", "spread_YES", "mid_YES"]
+                    v2_X = np.array([ttr_min, gap_abs, gap_pct, spread_yes, mid_yes]).reshape(1, -1)
+                    v2_df = pd.DataFrame(v2_X, columns=meta_v2_features)
+                    
+                    v2_raw_p = self._meta_v2_lgbm.predict_proba(v2_df)[0, 1]
+                    v2_final_p = self._meta_v2_calibrator.transform([v2_raw_p])[0]
+                    v2_final_p = float(max(0.0, min(1.0, v2_final_p)))
+                    
+                    logger.debug(
+                        "meta_v2_inference_complete",
+                        raw_p=round(v2_raw_p, 4),
+                        final_p=round(v2_final_p, 4),
+                        ttr=round(ttr_min, 1)
+                    )
+                    return v2_final_p
+                except Exception as e_v2:
+                    logger.error("meta_v2_inference_failed_falling_back", error=str(e_v2))
 
             # --- STAGE 1: Base Model Inference ---
             # LightGBM prediction
@@ -230,6 +263,10 @@ class ModelEnsemble:
         meta_scaler_path = model_dir / "meta_scaler.pkl"
         meta_calibrator_path = model_dir / "meta_calibrator_isotonic.pkl"
 
+        # Meta-Brain V2 paths
+        meta_v2_lgbm_path = model_dir / "meta_v2_lgbm.pkl"
+        meta_v2_calibrator_path = model_dir / "meta_v2_calibrator.pkl"
+
         # --- Diagnostic Debug Logging ---
         all_paths = {
             "stage1_lgbm": lgbm_path,
@@ -240,6 +277,8 @@ class ModelEnsemble:
             "stage2_meta_logreg": meta_logreg_path,
             "stage2_meta_scaler": meta_scaler_path,
             "stage2_meta_calibrator": meta_calibrator_path,
+            "meta_v2_lgbm": meta_v2_lgbm_path,
+            "meta_v2_calibrator": meta_v2_calibrator_path,
         }
         for name, path in all_paths.items():
             logger.debug("attempting_to_load_artifact", name=name, path=str(path), exists=path.exists())
@@ -289,6 +328,16 @@ class ModelEnsemble:
             else:
                 logger.warning("meta_brain_not_found_stacking_disabled")
 
+            # 3. Load Meta-Brain V2 (Microstructure)
+            if meta_v2_lgbm_path.exists() and meta_v2_calibrator_path.exists():
+                with open(meta_v2_lgbm_path, "rb") as f:
+                    self._meta_v2_lgbm = pickle.load(f)
+                with open(meta_v2_calibrator_path, "rb") as f:
+                    self._meta_v2_calibrator = pickle.load(f)
+                
+                self._has_meta_v2 = True
+                logger.info("meta_brain_v2_loaded_overriding_stack")
+
             self._version = version
             self._is_loaded = True
 
@@ -298,9 +347,7 @@ class ModelEnsemble:
                 has_logreg_s1=self._logreg_model is not None,
                 has_calibrator_s1=self._calibrator is not None,
                 has_meta_brain_s2=self._has_meta_brain,
-                has_meta_lgbm_s2=self._meta_lgbm is not None,
-                has_meta_logreg_s2=self._meta_logreg is not None,
-                has_meta_calibrator_s2=self._meta_calibrator_isotonic is not None,
+                has_meta_v2=self._has_meta_v2,
             )
             return True
 
