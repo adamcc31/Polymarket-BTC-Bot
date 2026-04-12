@@ -8,7 +8,7 @@
     "binance_min_depth_btc": 0.3
   },
   "signal": {
-    "margin_of_safety": 0.15,
+    "margin_of_safety": 0.08,
     "ttr_min_minutes": 1.5,
     "ttr_max_minutes": 4.8,
     "dynamic_ttr_enabled": true,
@@ -39,7 +39,7 @@
     "session_loss_limit_pct": 0.9,
     "consecutive_loss_multiplier": 0.15,
     "kelly_floor_multiplier": 0.25,
-    "max_buy_price": 0.65,
+    "max_buy_price": 0.70,
     "live_edge_tolerance": 0.05,
     "max_live_edge": 0.3
   },
