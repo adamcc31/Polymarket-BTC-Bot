@@ -221,15 +221,19 @@ class TradingBot:
                     # Export Shadow Book
                     sb_path = shadow_tracker.export_to_csv(self._exporter.session_dir)
                         
-                if trades_path:
+                if trades_path or sb_path:
                     try:
-                        await self._telegram.send_document(
-                            file_path=trades_path,
-                            caption=f"Session Report ({report_hours:.0f}h)\n\n{sum_text}",
-                        )
-                        logger.info("telegram_periodic_report_sent",
-                                    trades=metrics.trades_executed,
-                                    pnl=metrics.total_pnl_usd)
+                        if trades_path:
+                            await self._telegram.send_document(
+                                file_path=trades_path,
+                                caption=f"Session Report ({report_hours:.0f}h)\n\n{sum_text}",
+                            )
+                            logger.info("telegram_periodic_report_sent",
+                                        trades=metrics.trades_executed,
+                                        pnl=metrics.total_pnl_usd)
+                        else:
+                            await self._send_telegram(f"Session Report ({report_hours:.0f}h)", sum_text)
+                            logger.info("telegram_periodic_report_sent_text_only")
                                     
                         if sb_path:
                             try:
@@ -238,6 +242,7 @@ class TradingBot:
                                     caption=f"Shadow Book ({report_hours:.0f}h)",
                                 )
                                 shadow_tracker.clear_exported()
+                                logger.info("telegram_shadow_book_sent")
                             except Exception as e:
                                 logger.error("shadow_book_telegram_send_failed", error=str(e))
                                 
