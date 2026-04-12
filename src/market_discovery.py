@@ -16,17 +16,22 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import os
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional, Literal, Any
 
 import httpx
-import structlog
+try:
+    import structlog  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    structlog = None
+import logging
 
 from src.config_manager import ConfigManager
 from src.schemas import ActiveMarket
+from src.shadow_tracker import shadow_tracker
 
 logger = structlog.get_logger(__name__)
 
@@ -590,6 +595,14 @@ class MarketDiscovery:
                                 strike_price=parsed.strike_price,
                                 yes_prob=yes_prob,
                                 slug=slug,
+                            )
+                            shadow_tracker.on_candidate_found(
+                                timestamp=datetime.now(timezone.utc).isoformat(),
+                                slug=slug,
+                                market_id=parsed.market_id,
+                                strike_price=parsed.strike_price,
+                                ttr_minutes=parsed.TTR_minutes,
+                                yes_prob=yes_prob,
                             )
                     except httpx.HTTPError as e:
                         logger.warning("dynamic_5m_event_http_error", slug=slug, error=str(e))

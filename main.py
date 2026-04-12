@@ -81,7 +81,7 @@ from src.risk_manager import RiskManager
 from src.signal_generator import SignalGenerator
 from src.redeemer import RedeemerWorker
 from src.telegram_notifier import TelegramNotifier
-
+from src.shadow_tracker import shadow_tracker
 
 class TradingBot:
     """
@@ -210,12 +210,16 @@ class TradingBot:
                 sum_text = self._tg_kv(summary)
                 
                 trades_path = None
+                sb_path = None
                 if self._exporter:
                     # Export trades CSV from resolved trades list
                     self._exporter.export_trades(self._dry_run._resolved_trades)
                     trades_csv = self._exporter.session_dir / "trades.csv"
                     if trades_csv.exists():
                         trades_path = str(trades_csv)
+                        
+                    # Export Shadow Book
+                    sb_path = shadow_tracker.export_to_csv(self._exporter.session_dir)
                         
                 if trades_path:
                     try:
@@ -226,6 +230,17 @@ class TradingBot:
                         logger.info("telegram_periodic_report_sent",
                                     trades=metrics.trades_executed,
                                     pnl=metrics.total_pnl_usd)
+                                    
+                        if sb_path:
+                            try:
+                                await self._telegram.send_document(
+                                    file_path=str(sb_path),
+                                    caption=f"Shadow Book ({report_hours:.0f}h)",
+                                )
+                                shadow_tracker.clear_exported()
+                            except Exception as e:
+                                logger.error("shadow_book_telegram_send_failed", error=str(e))
+                                
                     except Exception as e:
                         logger.error("telegram_report_send_failed", error=str(e))
                 else:
@@ -586,6 +601,7 @@ class TradingBot:
 
         # ── Post-Mortem Aggregator ────────────────────────────
         if signal.signal == "ABSTAIN":
+            shadow_tracker.on_trade_aborted(market.market_id, reason=signal.abstain_reason)
             m_id = market.market_id
             if m_id not in self._post_mortem_tracker:
                 self._post_mortem_tracker[m_id] = {
@@ -627,16 +643,19 @@ class TradingBot:
         # Gate 1: Hard Cap
         if real_best_ask > max_buy_price:
             logger.info("trade_aborted", reason="PRICE_EXCEEDS_MAX_CAP", price=real_best_ask, cap=max_buy_price)
+            shadow_tracker.on_trade_aborted(market.market_id, reason="PRICE_EXCEEDS_MAX_CAP", live_edge=live_edge)
             return
 
         # Gate 2: Tolerance
         if edge_deviation > edge_tolerance:
             logger.info("trade_aborted", reason="EDGE_DEVIATION_TOO_HIGH", synthetic=round(synthetic_edge, 4), live=round(live_edge, 4), dev=round(edge_deviation, 4))
+            shadow_tracker.on_trade_aborted(market.market_id, reason="EDGE_DEVIATION_TOO_HIGH", live_edge=live_edge)
             return
 
         # Gate 3: Live Edge Positive
         if live_edge <= margin_of_safety:
             logger.info("trade_aborted", reason="LIVE_EDGE_NEGATIVE", live_edge=round(live_edge, 4), threshold=margin_of_safety)
+            shadow_tracker.on_trade_aborted(market.market_id, reason="LIVE_EDGE_NEGATIVE", live_edge=live_edge)
             return
 
         # Update signal with live verification data for risk and logging
@@ -658,6 +677,7 @@ class TradingBot:
 
         if isinstance(result, RejectedBet):
             logger.info("trade_rejected", reason=result.reason)
+            shadow_tracker.on_trade_aborted(market.market_id, reason=f"RISK_REJECTED_{result.reason}", live_edge=live_edge)
             return
 
         approved = result
@@ -667,6 +687,7 @@ class TradingBot:
         if self._mode == "dry-run":
             trade = self._dry_run.simulate_trade(signal, approved, market)
             self._discovery.mark_trade_executed()
+            shadow_tracker.on_trade_executed(market.market_id, trade.entry_price)
 
             # Telegram: trade opened (paper order).
             asyncio.create_task(
@@ -722,6 +743,7 @@ class TradingBot:
 
             if effective_bet_size is None:
                 await self._risk_mgr.on_trade_resolved(0.0)
+                shadow_tracker.on_trade_aborted(market.market_id, reason="LIVE_EXECUTION_FAILED", live_edge=live_edge)
             else:
                 trade = self._dry_run.simulate_trade(
                     signal,
@@ -731,6 +753,7 @@ class TradingBot:
                     bet_size_override=float(effective_bet_size),
                 )
                 self._discovery.mark_trade_executed()
+                shadow_tracker.on_trade_executed(market.market_id, trade.entry_price)
 
                 # Telegram: trade opened (shadow paper record for live).
                 asyncio.create_task(
