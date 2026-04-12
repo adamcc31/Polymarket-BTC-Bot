@@ -125,7 +125,7 @@ class TradingBot:
         self._redeemer = RedeemerWorker(self._config, self._execution)
 
         # Dry run / live engine
-        initial_capital = 50.0 if self._requested_mode == "dry-run" else 50.0
+        initial_capital = 30.0 if self._requested_mode == "dry-run" else 30.0
         self._dry_run = DryRunEngine(self._config, initial_capital=initial_capital)
         self._exporter = Exporter(self._dry_run.session_id)
 
