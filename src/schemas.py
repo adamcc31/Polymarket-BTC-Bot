@@ -151,6 +151,8 @@ class SignalResult(BaseModel):
             "NO_TRADE_ZONE",
             "BASIS_RISK_BLOCK",
             "BASIS_RISK_INFLATED",
+            "EDGE_TOO_HIGH_HALLUCINATION",
+            "PRICE_EXCEEDS_MAX_CAP",
         ]
     ] = None
     P_model: float = Field(..., ge=0.0, le=1.0)

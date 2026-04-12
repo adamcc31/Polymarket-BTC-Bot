@@ -378,13 +378,13 @@ class SignalGenerator:
         if chosen_ask > max_buy_price:
             logger.info(
                 "trade_aborted",
-                reason="PRICE_TOO_HIGH",
+                reason="PRICE_EXCEEDS_MAX_CAP",
                 ask=round(chosen_ask, 4),
                 max_buy=max_buy_price,
             )
             return SignalResult(
                 signal="ABSTAIN",
-                abstain_reason="PRICE_TOO_HIGH",
+                abstain_reason="PRICE_EXCEEDS_MAX_CAP",
                 P_model=P_model,
                 uncertainty_u=u_used,
                 edge_yes=edge_yes,
