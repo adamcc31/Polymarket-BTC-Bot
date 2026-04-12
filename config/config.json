@@ -3,9 +3,9 @@
   "_version": "1.0.0",
   "regime": {
     "vol_lower_threshold": 0.0,
-    "vol_upper_threshold": 0.98,
+    "vol_upper_threshold": 0.95,
     "binance_spread_max_bps": 20.0,
-    "binance_min_depth_btc": 0.1
+    "binance_min_depth_btc": 0.3
   },
   "signal": {
     "margin_of_safety": 0.02,
@@ -32,15 +32,16 @@
     "max_consecutive_404": 3
   },
   "risk": {
-    "kelly_divisor": 4,
+    "kelly_divisor": 6,
     "max_bet_fraction": 0.05,
     "min_bet_usd": 1.0,
     "daily_loss_limit_pct": 0.90,
     "session_loss_limit_pct": 0.90,
     "consecutive_loss_multiplier": 0.15,
     "kelly_floor_multiplier": 0.25,
-    "max_buy_price": 0.75,
-    "live_edge_tolerance": 0.05
+    "max_buy_price": 0.70,
+    "live_edge_tolerance": 0.05,
+    "max_live_edge": 0.20
   },
   "dry_run": {
     "pass_win_rate": 0.53,
@@ -113,6 +114,9 @@
   "fair_prob": {
     "base_uncertainty_p": 0.02,
     "near_expiry_u_boost": 0.10
+  },
+  "settlement": {
+    "non_binance_u_multiplier": 1.0
   },
   "telegram": {
     "enabled": true,

@@ -339,13 +339,58 @@ class SignalGenerator:
             )
 
         # ── STEP 6: FINAL SIGNAL SELECTION ───────────────────
+        # ── STEP 6: FINAL SIGNAL SELECTION ───────────────────
         if edge_yes > margin and edge_no > margin:
             # Both edges positive — pick larger
             signal = "BUY_INDEX_0" if edge_yes >= edge_no else "BUY_INDEX_1"
+            chosen_edge = max(edge_yes, edge_no)
+            chosen_ask = clob_state.yes_ask if edge_yes >= edge_no else clob_state.no_ask
         elif edge_yes > margin:
             signal = "BUY_INDEX_0"
+            chosen_edge = edge_yes
+            chosen_ask = clob_state.yes_ask
         else:
             signal = "BUY_INDEX_1"
+            chosen_edge = edge_no
+            chosen_ask = clob_state.no_ask
+
+        # ── HALLUCINATION & MAX PRICE GUARD ──────────────────
+        max_live_edge = float(self._config.get("risk.max_live_edge", 0.20))
+        max_buy_price = float(self._config.get("risk.max_buy_price", 0.70))
+
+        if chosen_edge > max_live_edge:
+            logger.info(
+                "trade_aborted",
+                reason="EDGE_TOO_HIGH_HALLUCINATION",
+                edge=round(chosen_edge, 6),
+                max_edge=max_live_edge,
+            )
+            return SignalResult(
+                signal="ABSTAIN",
+                abstain_reason="EDGE_TOO_HIGH_HALLUCINATION",
+                P_model=P_model,
+                uncertainty_u=u_used,
+                edge_yes=edge_yes,
+                edge_no=edge_no,
+                **base,
+            )
+
+        if chosen_ask > max_buy_price:
+            logger.info(
+                "trade_aborted",
+                reason="PRICE_TOO_HIGH",
+                ask=round(chosen_ask, 4),
+                max_buy=max_buy_price,
+            )
+            return SignalResult(
+                signal="ABSTAIN",
+                abstain_reason="PRICE_TOO_HIGH",
+                P_model=P_model,
+                uncertainty_u=u_used,
+                edge_yes=edge_yes,
+                edge_no=edge_no,
+                **base,
+            )
 
         logger.info(
             "signal_generated",
